@@ -13,7 +13,9 @@ class WebAppLogicTest(unittest.TestCase):
         }
 
     def test_dashboard_builds_suggestions_and_backtest(self):
-        dashboard = web_app.build_dashboard(web_app.DEMO_STATE, self.rates)
+        # Pass an empty forecast doc so the test does not depend on whether
+        # data/forecast_signals.json happens to exist on disk.
+        dashboard = web_app.build_dashboard(web_app.DEMO_STATE, self.rates, forecast_doc={})
 
         self.assertEqual(len(dashboard["exposures"]), 2)
         self.assertEqual(len(dashboard["hedges"]), 1)

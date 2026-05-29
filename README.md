@@ -321,6 +321,96 @@ python fx_risk_simulator.py sample_data.json --explain
 python fx_risk_gui.py
 ```
 
+## 外汇预测接入（Prophet）
+
+`forecast/` 目录提供一个独立的预测管线：拉历史汇率 → Prophet 训练 → 月度滚动回测 → 输出信号文件。Web 端读取信号后，会按"预测方向 + 模型质量"两个门槛调整锁汇建议。
+
+### 一次跑通
+
+先安装依赖（首次安装 prophet 在 Windows 上可能需要 2-5 分钟）：
+
+```powershell
+pip install prophet pandas
+```
+
+然后从项目根目录运行：
+
+```powershell
+python -m forecast.pipeline
+```
+
+管线会自动扫描 `data/fx_workspace.json` 里录入的币种，给每个币种对 CNY 跑一遍：
+
+1. 从 `exchangerate.host` 拉近 6 年历史日汇率，取每月最后一日，存到 `data/rates_history/{PAIR}.csv`
+2. 月度滚动回测算 MAPE 和方向准确率，存到 `data/backtest/{PAIR}.json`
+3. 输出未来 6 个月预测，存到 `data/forecasts/{PAIR}.csv`
+4. 汇总成 `data/forecast_signals.json`
+
+如果 exchangerate.host 要求 API key，可以：
+
+```powershell
+$env:EXCHANGERATE_HOST_KEY = "你的key"
+python -m forecast.pipeline
+```
+
+或在命令行直接传：`python -m forecast.pipeline --access-key 你的key`
+
+也可以指定特定币种：
+
+```powershell
+python -m forecast.pipeline --pair USD --pair EUR
+```
+
+历史已经拉过，只想重新训练：
+
+```powershell
+python -m forecast.pipeline --skip-fetch
+```
+
+### 信号怎么影响锁汇建议
+
+每条信号有三个关键字段：
+
+- `direction`：未来 6 个月相对当前汇率的整体方向（up / down / flat）
+- `mape`：滚动回测的平均绝对百分比误差
+- `direction_accuracy`：滚动回测的方向准确率
+- `tier`：综合质量分档
+  - `support`：MAPE ≤ 2.5% 且方向准确 ≥ 55%
+  - `caution`：MAPE ≤ 5% 且方向准确 ≥ 50%
+  - `reject`：其他
+
+锁汇建议按下表给目标套保比例叠加一个倍率：
+
+| tier | 方向不利 | 方向有利 |
+| --- | --- | --- |
+| support | 1.0× | 0.5× |
+| caution | 1.0× | 0.7× |
+| reject | 1.0× | 1.0× |
+
+"方向不利"指的是：
+
+- 未来要收外币（结汇）且预测外币贬值（down）
+- 未来要付外币（购汇）且预测外币升值（up）
+
+模型质量不达标（reject）时，系统忽略预测方向，落回原目标比例。
+
+### 看不到 forecast 信息怎么办？
+
+Web 端会自动检测 `data/forecast_signals.json`。这个文件不存在或为空时，建议卡片就只显示原有字段，不会报错。
+
+如果跑过 `forecast.pipeline` 但 Web 端仍看不到 chips：
+
+- 检查 `data/forecast_signals.json` 里有没有对应币种
+- 浏览器按 `Ctrl + F5` 强制刷新
+
+### 单独跑某一步
+
+```powershell
+python -m forecast.data_fetch --foreign USD
+python -m forecast.prophet_forecast --pair USDCNY
+python -m forecast.monthly_backtest --pair USDCNY
+```
+
 ## 测试命令
 
 ```powershell
@@ -338,6 +428,11 @@ node --check web\app.js
 │   ├── index.html              # 网页工作台
 │   ├── styles.css              # 页面样式
 │   └── app.js                  # 前端交互
+├── forecast/
+│   ├── data_fetch.py           # 从 exchangerate.host 拉历史月末汇率
+│   ├── prophet_forecast.py     # Prophet 训练 + 未来 6 月预测
+│   ├── monthly_backtest.py     # 月度滚动回测：MAPE + 方向准确率
+│   └── pipeline.py             # 扫 workspace 自动编排预测，输出信号
 ├── fx_risk_simulator.py        # 命令行模拟器
 ├── fx_risk_gui.py              # Tkinter 桌面界面
 ├── sample_data.json            # 命令行样例数据

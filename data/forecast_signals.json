@@ -1,0 +1,43 @@
+{
+  "generated_at": "2026-05-16T00:00:00Z",
+  "horizon_months": 6,
+  "base_currency": "CNY",
+  "signals": {
+    "USD": {
+      "pair": "USDCNY",
+      "current": 7.18,
+      "current_month": "2026-04",
+      "forecast": [
+        {"month": "2026-05", "rate": 7.20, "dir": "up"},
+        {"month": "2026-06", "rate": 7.22, "dir": "up"},
+        {"month": "2026-07", "rate": 7.24, "dir": "up"},
+        {"month": "2026-08", "rate": 7.26, "dir": "up"},
+        {"month": "2026-09", "rate": 7.27, "dir": "up"},
+        {"month": "2026-10", "rate": 7.28, "dir": "up"}
+      ],
+      "direction": "up",
+      "mape": 0.018,
+      "direction_accuracy": 0.62,
+      "n_test": 30,
+      "tier": "support"
+    },
+    "EUR": {
+      "pair": "EURCNY",
+      "current": 7.72,
+      "current_month": "2026-04",
+      "forecast": [
+        {"month": "2026-05", "rate": 7.78, "dir": "up"},
+        {"month": "2026-06", "rate": 7.82, "dir": "up"},
+        {"month": "2026-07", "rate": 7.85, "dir": "up"},
+        {"month": "2026-08", "rate": 7.88, "dir": "up"},
+        {"month": "2026-09", "rate": 7.90, "dir": "up"},
+        {"month": "2026-10", "rate": 7.92, "dir": "up"}
+      ],
+      "direction": "up",
+      "mape": 0.063,
+      "direction_accuracy": 0.42,
+      "n_test": 30,
+      "tier": "reject"
+    }
+  }
+}

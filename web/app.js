@@ -70,10 +70,25 @@ function renderDashboard(data) {
   renderConfig(data.config || {});
 }
 
+function rateStatusText(status) {
+  return {
+    live: "实时",
+    fallback: "内置兜底",
+    cached_after_refresh_error: "刷新失败·用缓存",
+  }[status] || status || "-";
+}
+
+function fmtTime(iso) {
+  if (!iso) return "-";
+  const d = new Date(iso);
+  if (Number.isNaN(d.getTime())) return iso;
+  return d.toLocaleString("zh-CN", { hour12: false });
+}
+
 function renderRateStatus(data) {
   const rates = data.rates || {};
   document.getElementById("rateStatus").textContent =
-    `Status: ${rates.status || "-"}, updated: ${rates.fetched_at || "-"}`;
+    `汇率：${rateStatusText(rates.status)} · 更新于 ${fmtTime(rates.fetched_at)}`;
 }
 
 function renderSuggestions(items) {
@@ -86,16 +101,69 @@ function renderSuggestions(items) {
   items.forEach((item) => {
     const card = document.createElement("div");
     card.className = "card";
+    const ratioLine = item.effective_hedge_ratio !== undefined && item.effective_hedge_ratio !== item.target_hedge_ratio
+      ? `${ratioText(item.target_hedge_ratio)} → 实际 ${ratioText(item.effective_hedge_ratio)}`
+      : ratioText(item.target_hedge_ratio);
     card.innerHTML = `
       <strong>${item.period} ${item.currency}</strong>
       <p>${item.plain_text}</p>
-      <p class="meta">剩余敞口：${money(item.net_exposure)}，目标套保比例：${ratioText(item.target_hedge_ratio)}，损益科目：${bucketName(item.accounting_bucket)}</p>
+      ${renderForecastBlock(item)}
+      <p class="meta">剩余敞口：${money(item.net_exposure)}，目标套保比例：${ratioLine}，损益科目：${bucketName(item.accounting_bucket)}</p>
       <p class="meta">建议金额：${money(item.recommended_amount)}，交易汇率：${item.trade_rate}，人民币风险：${money(item.risk_cny)}</p>
       <button type="button">按建议填入锁汇单</button>
     `;
     card.querySelector("button").addEventListener("click", () => fillHedgeFromSuggestion(item));
     box.appendChild(card);
   });
+}
+
+function renderForecastBlock(item) {
+  const s = item.forecast_signal;
+  if (!s) return "";
+  const tier = s.tier || "reject";
+  const dir = s.direction || "flat";
+  const chips = [];
+  chips.push(`<span class="chip dir-${dir}">${dirText(dir)}</span>`);
+  if (s.mape !== null && s.mape !== undefined) {
+    chips.push(`<span class="chip">MAPE ${(s.mape * 100).toFixed(1)}%</span>`);
+  }
+  if (s.direction_accuracy !== null && s.direction_accuracy !== undefined) {
+    chips.push(`<span class="chip">方向准确 ${(s.direction_accuracy * 100).toFixed(0)}%</span>`);
+  }
+  chips.push(`<span class="chip tier-${tier}">${tierText(tier)}</span>`);
+  const reason = item.forecast_reason ? `<p class="meta forecast-reason">${item.forecast_reason}</p>` : "";
+  return `
+    <div class="forecast-block">
+      <div class="forecast-chips">${chips.join("")}</div>
+      ${sparkline(s.forecast, s.current)}
+      ${reason}
+    </div>
+  `;
+}
+
+function dirText(dir) {
+  return { up: "预测 ↑", down: "预测 ↓", flat: "预测 →" }[dir] || dir;
+}
+
+function tierText(tier) {
+  return { support: "模型支持", caution: "模型谨慎", reject: "模型不达标" }[tier] || tier;
+}
+
+function sparkline(points, currentRate) {
+  if (!points || !points.length) return "";
+  const vals = (currentRate != null ? [Number(currentRate)] : []).concat(points.map((p) => Number(p.rate)));
+  const min = Math.min(...vals);
+  const max = Math.max(...vals);
+  const range = max - min || 1;
+  const w = 180;
+  const h = 38;
+  const stepX = vals.length > 1 ? w / (vals.length - 1) : w;
+  const yAt = (v) => (h - ((v - min) / range) * (h - 4)) - 2;
+  const path = vals.map((v, i) => `${i === 0 ? "M" : "L"}${(i * stepX).toFixed(1)},${yAt(v).toFixed(1)}`).join(" ");
+  return `<svg class="forecast-spark" width="${w}" height="${h}" viewBox="0 0 ${w} ${h}" aria-hidden="true">
+    <path d="${path}" fill="none" stroke="currentColor" stroke-width="1.5"/>
+    <circle cx="0" cy="${yAt(vals[0]).toFixed(1)}" r="2.4" fill="currentColor"/>
+  </svg>`;
 }
 
 function fillHedgeFromSuggestion(item) {
@@ -115,6 +183,12 @@ function renderNetExposure(rows) {
   const body = document.getElementById("netExposureRows");
   body.innerHTML = "";
   rows.forEach((row) => {
+    const net = Number(row.net_exposure);
+    const side = net > 0 ? { label: "净收", cls: "in" } : net < 0 ? { label: "净付", cls: "out" } : { label: "持平", cls: "flat" };
+    const rateCell = row.rate_available
+      ? `${row.current_rate}`
+      : '<span class="warn-tag" title="该币种暂无汇率，人民币金额无法估算">汇率缺失</span>';
+    const riskCell = row.rate_available ? money(row.cny_risk) : "—";
     const tr = document.createElement("tr");
     tr.innerHTML = `
       <td>${row.period}</td>
@@ -123,9 +197,9 @@ function renderNetExposure(rows) {
       <td>${ratioText(row.target_hedge_ratio)}</td>
       <td>${money(row.business_exposure)}</td>
       <td>${money(row.locked_exposure)}</td>
-      <td class="${row.net_exposure >= 0 ? "positive" : "negative"}">${money(row.net_exposure)}</td>
-      <td>${row.current_rate}</td>
-      <td>${money(row.cny_risk)}</td>
+      <td><span class="net-tag net-${side.cls}">${side.label}</span> ${money(Math.abs(net))}</td>
+      <td>${rateCell}</td>
+      <td>${riskCell}</td>
     `;
     body.appendChild(tr);
   });
@@ -195,9 +269,12 @@ function itemShell(row, title, detail, collection) {
     <button type="button" class="secondary">删除</button>
   `;
   div.querySelector("button").addEventListener("click", async () => {
-    await api(`/api/${collection}/${row.id}`, { method: "DELETE" });
-    await loadDashboard();
-    showStatus("已删除。");
+    if (!window.confirm(`确认删除这条记录？此操作无法撤销。\n${title}`)) return;
+    await runAction("正在删除...", async () => {
+      await api(`/api/${collection}/${row.id}`, { method: "DELETE" });
+      await loadDashboard();
+      showStatus("已删除。");
+    });
   });
   return div;
 }
@@ -308,6 +385,7 @@ function bindForms() {
   });
 
   document.getElementById("resetDemoBtn").addEventListener("click", async () => {
+    if (!window.confirm("恢复样例会覆盖当前所有已录入的敞口、锁汇和到期汇率数据，且无法撤销。确认继续？")) return;
     await runAction("正在恢复样例...", async () => {
       await api("/api/reset-demo", { method: "POST", body: "{}" });
       await loadDashboard();
@@ -359,6 +437,9 @@ async function runAction(busyMessage, action, finallyAction = null) {
 
 bindForms();
 setDefaultDates();
-loadDashboard().catch((error) => {
-  showStatus(error.message, "error");
-});
+showStatus("正在加载数据...", "busy");
+loadDashboard()
+  .then(() => showStatus("数据已就绪。"))
+  .catch((error) => {
+    showStatus(error.message, "error");
+  });

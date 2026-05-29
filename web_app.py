@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import json
 import mimetypes
+import threading
 import uuid
 from collections import defaultdict
 from datetime import datetime, timezone
@@ -18,7 +19,12 @@ WEB_ROOT = ROOT / "web"
 DATA_DIR = ROOT / "data"
 STATE_FILE = DATA_DIR / "fx_workspace.json"
 RATES_CACHE_FILE = DATA_DIR / "rates_cache.json"
+FORECAST_SIGNALS_FILE = DATA_DIR / "forecast_signals.json"
 BASE_CURRENCY = "CNY"
+
+# Serializes the read-modify-write of the JSON state file so concurrent
+# requests on the ThreadingHTTPServer can't clobber each other.
+STATE_LOCK = threading.Lock()
 
 
 DEFAULT_CONFIG = {
@@ -204,6 +210,32 @@ def load_rates(config: dict, force: bool = False) -> dict:
         return cache
 
 
+def load_forecast_signals() -> dict:
+    if not FORECAST_SIGNALS_FILE.exists():
+        return {}
+    try:
+        return json.loads(FORECAST_SIGNALS_FILE.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+
+
+def forecast_multiplier(signal: dict | None, net: float) -> tuple[float, str | None]:
+    if not signal:
+        return 1.0, None
+    tier = signal.get("tier")
+    direction = signal.get("direction")
+    unfavorable = (direction == "down") if net > 0 else (direction == "up")
+    if tier == "support":
+        if unfavorable:
+            return 1.0, "模型质量达标，预测对你不利，按目标比例锁汇"
+        return 0.5, "模型质量达标，预测对你有利，降到目标比例的 50%"
+    if tier == "caution":
+        if unfavorable:
+            return 1.0, "模型质量一般，预测不利，按目标比例锁汇"
+        return 0.7, "模型质量一般，预测有利，降到目标比例的 70%"
+    return 1.0, "模型质量不达标，忽略预测方向，按目标比例锁汇"
+
+
 def signed_exposure(row: dict) -> float:
     amount = float(row.get("amount", 0)) * float(row.get("probability", 1))
     if row.get("direction") in {"receipt", "asset", "export"}:
@@ -319,12 +351,15 @@ def scenario_projection(
     return rows
 
 
-def build_dashboard(state: dict, rates_cache: dict) -> dict:
+def build_dashboard(state: dict, rates_cache: dict, forecast_doc: dict | None = None) -> dict:
     pair_rates = rates_cache.get("pair_rates", {})
     exposures = state.get("exposures", [])
     hedges = state.get("hedges", [])
     settlements = state.get("settlements", [])
     config = merged_config(state)
+    if forecast_doc is None:
+        forecast_doc = load_forecast_signals()
+    forecast_signals = forecast_doc.get("signals", {}) if forecast_doc else {}
 
     exposure_totals = aggregate_rows(exposures, signed_exposure)
     hedge_totals = aggregate_rows(hedges, signed_hedge)
@@ -339,6 +374,7 @@ def build_dashboard(state: dict, rates_cache: dict) -> dict:
         hedged = hedge_totals.get((period, currency), 0.0)
         net = gross + hedged
         rate = current_rate(pair_rates, currency)
+        rate_available = currency in pair_rates or currency in FALLBACK_PAIR_RATES
         cny_risk = abs(net * rate)
         target_ratio = hedge_ratio_for(config, period, currency)
         category = exposure_category_for(exposures, period, currency)
@@ -352,10 +388,14 @@ def build_dashboard(state: dict, rates_cache: dict) -> dict:
                 "locked_exposure": round(hedged, 2),
                 "net_exposure": round(net, 2),
                 "current_rate": rate,
+                "rate_available": rate_available,
                 "cny_risk": round(cny_risk, 2),
             }
         )
-        target_cover = abs(gross) * target_ratio
+        signal = forecast_signals.get(currency)
+        multiplier, multiplier_reason = forecast_multiplier(signal, net)
+        effective_ratio = target_ratio * multiplier
+        target_cover = abs(gross) * effective_ratio
         covered = abs(hedged)
         recommended_amount = max(0.0, target_cover - covered)
         if abs(net) > 0 and recommended_amount > 0:
@@ -371,10 +411,14 @@ def build_dashboard(state: dict, rates_cache: dict) -> dict:
                 "trade_rate": rate,
                 "risk_cny": round(cny_risk, 2),
                 "target_hedge_ratio": target_ratio,
+                "effective_hedge_ratio": round(effective_ratio, 4),
+                "forecast_multiplier": round(multiplier, 4),
+                "forecast_reason": multiplier_reason,
+                "forecast_signal": signal,
                 "recommended_amount": round(recommended_amount, 2),
                 "action": action,
                 "accounting_bucket": accounting_bucket(category, now_iso()[:10], f"{period}-28"),
-                "plain_text": suggestion_text(currency, net, target_ratio, recommended_amount, action),
+                "plain_text": suggestion_text(currency, net, effective_ratio, recommended_amount, action),
             }
             recommendation["scenario_projection"] = scenario_projection(
                 period, currency, net, recommendation, rate, scenario_rates
@@ -394,6 +438,7 @@ def build_dashboard(state: dict, rates_cache: dict) -> dict:
         "scenario_rates": scenario_rates,
         "scenario_summary": scenario_summary,
         "backtest": backtest_rows,
+        "forecast": forecast_doc,
         "plain_language": build_plain_language(net_rows, suggestions, backtest_rows, rates_cache),
     }
 
@@ -440,7 +485,6 @@ def build_backtest(exposures: list[dict], hedges: list[dict], settlements: list[
                     "effect_cny": round(effect, 2),
                 }
             )
-        unhedged_result = gross * (actual_rate - market_rate)
         rows.append(
             {
                 "period": period,
@@ -448,7 +492,6 @@ def build_backtest(exposures: list[dict], hedges: list[dict], settlements: list[
                 "business_exposure": round(gross, 2),
                 "actual_rate": round(actual_rate, 6),
                 "reference_rate": round(market_rate, 6),
-                "unhedged_mark_to_market_cny": round(unhedged_result, 2),
                 "hedge_effect_cny": round(hedge_effect, 2),
                 "locked_detail": locked_detail,
                 "plain_text": (
@@ -516,56 +559,60 @@ class FxRiskHandler(BaseHTTPRequestHandler):
         self.send_error(404)
 
     def do_POST(self) -> None:
-        state = ensure_state()
         try:
             body = parse_body(self)
-            if self.path == "/api/exposures":
-                validate_exposure(body)
-                state.setdefault("exposures", []).append(add_id(body))
-                save_state(state)
-                self.send_json({"ok": True})
-                return
-            if self.path == "/api/hedges":
-                validate_hedge(body)
-                state.setdefault("hedges", []).append(add_id(body))
-                save_state(state)
-                self.send_json({"ok": True})
-                return
-            if self.path == "/api/settlements":
-                validate_settlement(body)
-                state.setdefault("settlements", []).append(add_id(body))
-                save_state(state)
-                self.send_json({"ok": True})
-                return
-            if self.path == "/api/config":
-                merged = dict(DEFAULT_CONFIG)
-                merged.update(state.get("config", {}))
-                merged.update(body)
-                state["config"] = merged
-                save_state(state)
-                self.send_json({"ok": True, "config": merged})
-                return
+            # Network refresh touches only the rate cache, so keep it outside
+            # the state lock to avoid holding it during the HTTP fetch.
             if self.path == "/api/rates/refresh":
-                self.send_json(load_rates(merged_config(state), force=True))
+                self.send_json(load_rates(merged_config(ensure_state()), force=True))
                 return
-            if self.path == "/api/reset-demo":
-                save_state(DEMO_STATE)
-                self.send_json({"ok": True})
-                return
+            with STATE_LOCK:
+                state = ensure_state()
+                if self.path == "/api/exposures":
+                    validate_exposure(body)
+                    state.setdefault("exposures", []).append(add_id(body))
+                    save_state(state)
+                    self.send_json({"ok": True})
+                    return
+                if self.path == "/api/hedges":
+                    validate_hedge(body)
+                    state.setdefault("hedges", []).append(add_id(body))
+                    save_state(state)
+                    self.send_json({"ok": True})
+                    return
+                if self.path == "/api/settlements":
+                    validate_settlement(body)
+                    state.setdefault("settlements", []).append(add_id(body))
+                    save_state(state)
+                    self.send_json({"ok": True})
+                    return
+                if self.path == "/api/config":
+                    merged = dict(DEFAULT_CONFIG)
+                    merged.update(state.get("config", {}))
+                    merged.update(body)
+                    state["config"] = merged
+                    save_state(state)
+                    self.send_json({"ok": True, "config": merged})
+                    return
+                if self.path == "/api/reset-demo":
+                    save_state(DEMO_STATE)
+                    self.send_json({"ok": True})
+                    return
         except (ValueError, KeyError, json.JSONDecodeError) as exc:
             self.send_json({"ok": False, "error": str(exc)}, status=400)
             return
         self.send_error(404)
 
     def do_DELETE(self) -> None:
-        state = ensure_state()
         parts = self.path.strip("/").split("/")
         if len(parts) == 3 and parts[0] == "api":
             collection = {"exposures": "exposures", "hedges": "hedges", "settlements": "settlements"}.get(parts[1])
             if collection:
-                before = len(state.get(collection, []))
-                state[collection] = [row for row in state.get(collection, []) if row.get("id") != parts[2]]
-                save_state(state)
+                with STATE_LOCK:
+                    state = ensure_state()
+                    before = len(state.get(collection, []))
+                    state[collection] = [row for row in state.get(collection, []) if row.get("id") != parts[2]]
+                    save_state(state)
                 self.send_json({"ok": True, "deleted": before - len(state[collection])})
                 return
         self.send_error(404)
