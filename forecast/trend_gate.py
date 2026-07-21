@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -67,11 +68,14 @@ def evaluate_series(closes: list[float]) -> dict:
     else:
         alignment = sum(1 for v in last_diffs if v != 0 and (v < 0) == (d1_last < 0))
 
+    # ATR 为零（钉住汇率、数据源节假日回填）时 energy 会是 NaN/inf，
+    # 落进 JSON 会写出非法的 NaN 字面量，必须转成 None
     e_last = float(energy.iloc[-1])
+    e_out = round(e_last, 4) if math.isfinite(e_last) else None
     return {
         "direction": direction,
         "alignment": alignment,
-        "energy": round(e_last, 4),
+        "energy": e_out,
         "n_days": len(closes),
     }
 

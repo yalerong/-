@@ -6,6 +6,8 @@ import csv
 import json
 from pathlib import Path
 
+from .monthly_backtest import NOMINAL_INTERVAL
+
 ROOT = Path(__file__).resolve().parent.parent
 HISTORY_DIR = ROOT / "data" / "rates_history"
 FORECAST_DIR = ROOT / "data" / "forecasts"
@@ -36,6 +38,7 @@ def forecast_pair(pair: str, horizon_months: int = 6) -> dict:
         daily_seasonality=False,
         yearly_seasonality=True,
         changepoint_prior_scale=0.05,
+        interval_width=NOMINAL_INTERVAL,
     )
     model.fit(df)
     future = model.make_future_dataframe(periods=horizon_months, freq="ME", include_history=False)
@@ -48,6 +51,8 @@ def forecast_pair(pair: str, horizon_months: int = 6) -> dict:
         rows.append({
             "month": r["ds"].strftime("%Y-%m"),
             "rate": round(yhat, 6),
+            "lower": round(float(r["yhat_lower"]), 6),
+            "upper": round(float(r["yhat_upper"]), 6),
             "dir": "up" if yhat > prev else ("down" if yhat < prev else "flat"),
         })
         prev = yhat
@@ -59,9 +64,9 @@ def forecast_pair(pair: str, horizon_months: int = 6) -> dict:
     out_csv = FORECAST_DIR / f"{pair}.csv"
     with out_csv.open("w", newline="", encoding="utf-8") as f:
         w = csv.writer(f)
-        w.writerow(["month", "yhat", "dir"])
+        w.writerow(["month", "yhat", "yhat_lower", "yhat_upper", "dir"])
         for r in rows:
-            w.writerow([r["month"], r["rate"], r["dir"]])
+            w.writerow([r["month"], r["rate"], r["lower"], r["upper"], r["dir"]])
 
     return {
         "pair": pair,

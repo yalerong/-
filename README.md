@@ -373,6 +373,7 @@ python -m forecast.pipeline --skip-fetch
 每条信号有三个关键字段：
 
 - `direction`：未来 6 个月相对当前汇率的整体方向（up / down / flat）
+- `forecast[].lower / upper`：每月预测的 80% 区间上下界
 - `mape`：滚动回测的平均绝对百分比误差
 - `direction_accuracy`：滚动回测的方向准确率
 - `interval_coverage`：实际值落在 80% 预测区间内的比例（应接近 80%，太低说明模型低估不确定性）
@@ -391,6 +392,8 @@ python -m forecast.pipeline --skip-fetch
 | support | 1.0× | 0.5× |
 | caution | 1.0× | 0.7× |
 | reject | 1.0× | 1.0× |
+
+另有一道信噪比闸门：预测期末变动幅度若未超过模型自身 MAPE，说明"有利方向"仍在误差范围内，即使 support/caution 也不打折、按目标比例足额锁汇。
 
 "方向不利"指的是：
 

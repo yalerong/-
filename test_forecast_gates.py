@@ -1,6 +1,8 @@
+import json
 import math
 import unittest
 
+import web_app
 from forecast import pipeline, trend_gate
 
 
@@ -82,6 +84,50 @@ class TrendGateTest(unittest.TestCase):
     def test_too_short_raises(self):
         with self.assertRaises(RuntimeError):
             trend_gate.evaluate_series([100.0] * 30)
+
+    def test_zero_atr_yields_json_safe_energy(self):
+        # 尾段完全不动（钉住汇率/节假日回填）→ ATR=0，energy 必须是 None 而不是 NaN
+        closes = self._series(+0.3)[:100] + [200.0] * 20
+        out = trend_gate.evaluate_series(closes)
+        self.assertIsNone(out["energy"])
+        json.dumps(out, allow_nan=False)  # 不应抛错
+
+    def test_constant_series_is_flat(self):
+        out = trend_gate.evaluate_series([7.2] * 120)
+        self.assertEqual(out["direction"], "flat")
+        self.assertEqual(out["alignment"], 0)
+        self.assertIsNone(out["energy"])
+
+
+class ForecastMultiplierTest(unittest.TestCase):
+    def _signal(self, tier="support", direction="up", current=7.2, final=7.5, mape=0.02):
+        return {
+            "tier": tier,
+            "direction": direction,
+            "current": current,
+            "mape": mape,
+            "forecast": [{"month": "2026-12", "rate": final}],
+        }
+
+    def test_favorable_support_discounts(self):
+        # 收外币(net>0)且预测外币升值：幅度 4.2% >> MAPE 2%，允许降到 50%
+        mult, reason = web_app.forecast_multiplier(self._signal(), net=1000)
+        self.assertEqual(mult, 0.5)
+
+    def test_favorable_but_within_noise_no_discount(self):
+        # 预测幅度 0.69% < MAPE 2%：方向有利也不打折
+        mult, reason = web_app.forecast_multiplier(self._signal(final=7.25), net=1000)
+        self.assertEqual(mult, 1.0)
+        self.assertIn("未超过模型误差", reason)
+
+    def test_unfavorable_always_full(self):
+        mult, _ = web_app.forecast_multiplier(self._signal(direction="down"), net=1000)
+        self.assertEqual(mult, 1.0)
+
+    def test_reject_ignores_direction(self):
+        mult, reason = web_app.forecast_multiplier(self._signal(tier="reject"), net=1000)
+        self.assertEqual(mult, 1.0)
+        self.assertIn("不达标", reason)
 
 
 if __name__ == "__main__":
