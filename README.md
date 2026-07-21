@@ -341,10 +341,11 @@ python -m forecast.pipeline
 
 管线会自动扫描 `data/fx_workspace.json` 里录入的币种，给每个币种对 CNY 跑一遍：
 
-1. 从 `exchangerate.host` 拉近 6 年历史日汇率，取每月最后一日，存到 `data/rates_history/{PAIR}.csv`
-2. 月度滚动回测算 MAPE 和方向准确率，存到 `data/backtest/{PAIR}.json`
+1. 从 `exchangerate.host` 拉近 6 年历史日汇率，取每月最后一日，存到 `data/rates_history/{PAIR}.csv`（日线同时存 `{PAIR}_daily.csv` 供趋势 gate 用）
+2. 月度滚动回测算 MAPE、方向准确率、80% 预测区间覆盖率，存到 `data/backtest/{PAIR}.json`
 3. 输出未来 6 个月预测，存到 `data/forecasts/{PAIR}.csv`
-4. 汇总成 `data/forecast_signals.json`
+4. 用日线算 GMMA 势能趋势 gate（方向 + 层级一致度 0~6）
+5. 汇总成 `data/forecast_signals.json`
 
 如果 exchangerate.host 要求 API key，可以：
 
@@ -372,12 +373,17 @@ python -m forecast.pipeline --skip-fetch
 每条信号有三个关键字段：
 
 - `direction`：未来 6 个月相对当前汇率的整体方向（up / down / flat）
+- `forecast[].lower / upper`：每月预测的 80% 区间上下界
 - `mape`：滚动回测的平均绝对百分比误差
 - `direction_accuracy`：滚动回测的方向准确率
-- `tier`：综合质量分档
-  - `support`：MAPE ≤ 2.5% 且方向准确 ≥ 55%
-  - `caution`：MAPE ≤ 5% 且方向准确 ≥ 50%
-  - `reject`：其他
+- `interval_coverage`：实际值落在 80% 预测区间内的比例（应接近 80%，太低说明模型低估不确定性）
+- `trend`：GMMA 势能趋势 gate（`direction` 方向、`alignment` 六层一致度、`energy` 带符号势能）
+- `tier`：综合质量分档，`tier_reasons` 记录每一次降档原因
+  - `support`：MAPE ≤ 2.5% 且方向准确 ≥ 55%，且同时满足——
+    回测样本 ≥ 24、方向准确率通过单侧二项检验（p ≤ 0.10）、区间覆盖率 ≥ 70%
+  - `caution`：MAPE ≤ 5% 且方向准确 ≥ 50%，且区间覆盖率 ≥ 40%；或 support 条件未全部满足降档而来
+  - `reject`：其他（覆盖率 < 40% 视为预测区间失真，直接 reject）
+  - 预测方向与 GMMA 强趋势（一致度 ≥ 5/6）相反时，再降一档
 
 锁汇建议按下表给目标套保比例叠加一个倍率：
 
@@ -386,6 +392,8 @@ python -m forecast.pipeline --skip-fetch
 | support | 1.0× | 0.5× |
 | caution | 1.0× | 0.7× |
 | reject | 1.0× | 1.0× |
+
+另有一道信噪比闸门：预测期末变动幅度若未超过模型自身 MAPE，说明"有利方向"仍在误差范围内，即使 support/caution 也不打折、按目标比例足额锁汇。
 
 "方向不利"指的是：
 
@@ -431,8 +439,9 @@ node --check web\app.js
 ├── forecast/
 │   ├── data_fetch.py           # 从 exchangerate.host 拉历史月末汇率
 │   ├── prophet_forecast.py     # Prophet 训练 + 未来 6 月预测
-│   ├── monthly_backtest.py     # 月度滚动回测：MAPE + 方向准确率
-│   └── pipeline.py             # 扫 workspace 自动编排预测，输出信号
+│   ├── monthly_backtest.py     # 月度滚动回测：MAPE + 方向准确率 + 区间覆盖率
+│   ├── trend_gate.py           # GMMA 势能趋势 gate（日线 EMA 结构）
+│   └── pipeline.py             # 扫 workspace 自动编排预测，分档定级，输出信号
 ├── fx_risk_simulator.py        # 命令行模拟器
 ├── fx_risk_gui.py              # Tkinter 桌面界面
 ├── sample_data.json            # 命令行样例数据

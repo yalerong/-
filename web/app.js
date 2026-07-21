@@ -130,8 +130,18 @@ function renderForecastBlock(item) {
   if (s.direction_accuracy !== null && s.direction_accuracy !== undefined) {
     chips.push(`<span class="chip">方向准确 ${(s.direction_accuracy * 100).toFixed(0)}%</span>`);
   }
+  if (s.interval_coverage !== null && s.interval_coverage !== undefined) {
+    chips.push(`<span class="chip">区间覆盖 ${(s.interval_coverage * 100).toFixed(0)}%</span>`);
+  }
+  if (s.trend && (s.trend.direction === "up" || s.trend.direction === "down")) {
+    const arrow = s.trend.direction === "up" ? "↑" : "↓";
+    chips.push(`<span class="chip">势能 ${arrow} ${s.trend.alignment}/6</span>`);
+  }
   chips.push(`<span class="chip tier-${tier}">${tierText(tier)}</span>`);
-  const reason = item.forecast_reason ? `<p class="meta forecast-reason">${item.forecast_reason}</p>` : "";
+  const notes = [];
+  if (item.forecast_reason) notes.push(item.forecast_reason);
+  if (s.tier_reasons && s.tier_reasons.length) notes.push(...s.tier_reasons);
+  const reason = notes.length ? `<p class="meta forecast-reason">${notes.join("；")}</p>` : "";
   return `
     <div class="forecast-block">
       <div class="forecast-chips">${chips.join("")}</div>

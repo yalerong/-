@@ -219,21 +219,44 @@ def load_forecast_signals() -> dict:
         return {}
 
 
+def forecast_expected_move(signal: dict | None) -> float | None:
+    """预测期末相对当前汇率的变动幅度（绝对值）。"""
+    if not signal:
+        return None
+    rows = signal.get("forecast") or []
+    current = signal.get("current")
+    if not rows or not current:
+        return None
+    try:
+        final = float(rows[-1]["rate"])
+        current = float(current)
+    except (KeyError, TypeError, ValueError):
+        return None
+    if current == 0:
+        return None
+    return abs(final / current - 1)
+
+
 def forecast_multiplier(signal: dict | None, net: float) -> tuple[float, str | None]:
     if not signal:
         return 1.0, None
     tier = signal.get("tier")
     direction = signal.get("direction")
     unfavorable = (direction == "down") if net > 0 else (direction == "up")
-    if tier == "support":
-        if unfavorable:
+    if tier not in ("support", "caution"):
+        return 1.0, "模型质量不达标，忽略预测方向，按目标比例锁汇"
+    if unfavorable:
+        if tier == "support":
             return 1.0, "模型质量达标，预测对你不利，按目标比例锁汇"
+        return 1.0, "模型质量一般，预测不利，按目标比例锁汇"
+    # 信噪比闸门：预测幅度没超过模型自身误差，就不足以支撑少锁
+    move = forecast_expected_move(signal)
+    mape = signal.get("mape")
+    if move is not None and mape is not None and move <= mape:
+        return 1.0, f"预测有利但幅度 {move:.1%} 未超过模型误差 {mape:.1%}，不足以支撑少锁，按目标比例锁汇"
+    if tier == "support":
         return 0.5, "模型质量达标，预测对你有利，降到目标比例的 50%"
-    if tier == "caution":
-        if unfavorable:
-            return 1.0, "模型质量一般，预测不利，按目标比例锁汇"
-        return 0.7, "模型质量一般，预测有利，降到目标比例的 70%"
-    return 1.0, "模型质量不达标，忽略预测方向，按目标比例锁汇"
+    return 0.7, "模型质量一般，预测有利，降到目标比例的 70%"
 
 
 def signed_exposure(row: dict) -> float:
