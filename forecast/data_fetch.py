@@ -79,7 +79,9 @@ def fetch_pair(foreign: str, quote: str = "CNY", years: int = 6, access_key: str
         raise RuntimeError(f"No data returned for {foreign}{quote}")
     monthly = to_month_end(daily)
     path = write_history(f"{foreign}{quote}", monthly)
-    print(f"[fetch] {foreign}{quote}: {len(monthly)} month-end points -> {path}")
+    daily_rows = sorted(daily.items(), key=lambda r: r[0])
+    write_history(f"{foreign}{quote}_daily", daily_rows)
+    print(f"[fetch] {foreign}{quote}: {len(monthly)} month-end points ({len(daily_rows)} daily) -> {path}")
     return path
 
 
