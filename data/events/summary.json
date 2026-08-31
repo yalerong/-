@@ -1,0 +1,43 @@
+{
+  "source_rows": 2345,
+  "tz_check": {
+    "checked": 944,
+    "matched": 941,
+    "rate": 0.996822033898305
+  },
+  "items_kept": 4910,
+  "dropped_duplicate": 22,
+  "dropped_other_category": 4437,
+  "dropped_no_quote_day": 34,
+  "by_category": {
+    "US_DATA": 1296,
+    "TRADE": 1175,
+    "CN_POL": 939,
+    "US_MON": 861,
+    "CN_DATA": 364,
+    "FX_POL": 275
+  },
+  "by_section": {
+    "single": 1945,
+    "国际要闻": 1404,
+    "国内新闻": 759,
+    "国际新闻": 747,
+    "今日重点关注": 49,
+    "国内要闻": 6
+  },
+  "by_year": {
+    "2019": 143,
+    "2020": 139,
+    "2021": 317,
+    "2022": 717,
+    "2023": 923,
+    "2024": 776,
+    "2025": 1075,
+    "2026": 820
+  },
+  "event_day_span": [
+    "2019-06-28",
+    "2026-08-21"
+  ],
+  "distinct_event_days": 1430
+}
