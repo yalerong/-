@@ -1,0 +1,101 @@
+{
+  "frozen_rules": "docs/event-driven-plan-v2.md",
+  "note": "该样本外窗口上的第二次也是最后一次检验；主判据门槛 p<=0.025",
+  "quote_days": 1787,
+  "main": {
+    "train": {
+      "n": 380,
+      "hits": 209,
+      "hit_rate": 0.55,
+      "p_binom": 0.0288
+    },
+    "oos": {
+      "n": 110,
+      "hits": 60,
+      "hit_rate": 0.5455,
+      "p_binom": 0.1955
+    },
+    "placebo_oos": {
+      "n_runs": 1000,
+      "share_ge_real": 0.182,
+      "placebo_median": 0.5,
+      "placebo_p95": 0.5818
+    },
+    "baseline_B3": {
+      "train": {
+        "n": 455,
+        "hits": 249,
+        "hit_rate": 0.5473,
+        "p_binom": 0.0244
+      },
+      "oos": {
+        "n": 117,
+        "hits": 64,
+        "hit_rate": 0.547,
+        "p_binom": 0.1776
+      }
+    },
+    "incremental_oos_p": 0.5094,
+    "oos_r5": {
+      "n": 110,
+      "hits": 56,
+      "hit_rate": 0.5091,
+      "p_binom": 0.462
+    }
+  },
+  "strict": {
+    "train": {
+      "n": 145,
+      "hits": 77,
+      "hit_rate": 0.531,
+      "p_binom": 0.2533
+    },
+    "oos": {
+      "n": 23,
+      "hits": 12,
+      "hit_rate": 0.5217,
+      "p_binom": 0.5
+    },
+    "placebo_oos": {
+      "n_runs": 1000,
+      "share_ge_real": 0.437,
+      "placebo_median": 0.4783,
+      "placebo_p95": 0.6522
+    },
+    "baseline_B4": {
+      "train": {
+        "n": 164,
+        "hits": 89,
+        "hit_rate": 0.5427,
+        "p_binom": 0.155
+      },
+      "oos": {
+        "n": 26,
+        "hits": 14,
+        "hit_rate": 0.5385,
+        "p_binom": 0.4225
+      }
+    },
+    "incremental_oos_p": 0.5466,
+    "oos_r5": {
+      "n": 24,
+      "hits": 12,
+      "hit_rate": 0.5,
+      "p_binom": 0.5806
+    }
+  },
+  "rF": {
+    "train": {
+      "n": 1275,
+      "hits": 710,
+      "hit_rate": 0.5569,
+      "p_binom": 0.0
+    },
+    "oos": {
+      "n": 382,
+      "hits": 218,
+      "hit_rate": 0.5707,
+      "p_binom": 0.0033
+    }
+  }
+}
