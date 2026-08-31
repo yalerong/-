@@ -1,0 +1,181 @@
+{
+  "frozen_rules": "docs/event-driven-plan.md",
+  "seed": 20260830,
+  "quote_days": 1771,
+  "event_days_raw": 1430,
+  "main_3bp_0.2pct": {
+    "train": {
+      "n": 554,
+      "hits": 277,
+      "hit_rate": 0.5,
+      "p_binom": 0.5169
+    },
+    "oos": {
+      "n": 207,
+      "hits": 110,
+      "hit_rate": 0.5314,
+      "p_binom": 0.2022
+    },
+    "placebo_oos": {
+      "n_runs": 1000,
+      "share_ge_real": 0.199,
+      "placebo_median": 0.4976,
+      "placebo_p95": 0.5604
+    },
+    "baseline_B1": {
+      "train": {
+        "n": 578,
+        "hits": 310,
+        "hit_rate": 0.5363,
+        "p_binom": 0.044
+      },
+      "oos": {
+        "n": 207,
+        "hits": 110,
+        "hit_rate": 0.5314,
+        "p_binom": 0.2022
+      }
+    },
+    "incremental_B1_oos_p": 0.5,
+    "baseline_B2": {
+      "train": {
+        "n": 1285,
+        "hits": 640,
+        "hit_rate": 0.4981,
+        "p_binom": 0.5665
+      },
+      "oos": {
+        "n": 389,
+        "hits": 193,
+        "hit_rate": 0.4961,
+        "p_binom": 0.5803
+      }
+    },
+    "incremental_B2_oos_p": 0.2062,
+    "oos_r0": {
+      "n": 209,
+      "hits": 128,
+      "hit_rate": 0.6124,
+      "p_binom": 0.0007
+    },
+    "oos_r5": {
+      "n": 208,
+      "hits": 110,
+      "hit_rate": 0.5288,
+      "p_binom": 0.2229
+    }
+  },
+  "strict_10bp_0.5pct": {
+    "train": {
+      "n": 159,
+      "hits": 75,
+      "hit_rate": 0.4717,
+      "p_binom": 0.7861
+    },
+    "oos": {
+      "n": 42,
+      "hits": 21,
+      "hit_rate": 0.5,
+      "p_binom": 0.5612
+    },
+    "placebo_oos": {
+      "n_runs": 1000,
+      "share_ge_real": 0.575,
+      "placebo_median": 0.5,
+      "placebo_p95": 0.5952
+    },
+    "baseline_B1": {
+      "train": {
+        "n": 578,
+        "hits": 310,
+        "hit_rate": 0.5363,
+        "p_binom": 0.044
+      },
+      "oos": {
+        "n": 207,
+        "hits": 110,
+        "hit_rate": 0.5314,
+        "p_binom": 0.2022
+      }
+    },
+    "incremental_B1_oos_p": 0.6449,
+    "baseline_B2": {
+      "train": {
+        "n": 1285,
+        "hits": 640,
+        "hit_rate": 0.4981,
+        "p_binom": 0.5665
+      },
+      "oos": {
+        "n": 389,
+        "hits": 193,
+        "hit_rate": 0.4961,
+        "p_binom": 0.5803
+      }
+    },
+    "incremental_B2_oos_p": 0.4811,
+    "oos_r0": {
+      "n": 42,
+      "hits": 33,
+      "hit_rate": 0.7857,
+      "p_binom": 0.0001
+    },
+    "oos_r5": {
+      "n": 42,
+      "hits": 25,
+      "hit_rate": 0.5952,
+      "p_binom": 0.14
+    }
+  },
+  "volatility": {
+    "train": {
+      "n_event": 560,
+      "n_non_event": 804,
+      "median_event": 0.001365,
+      "median_non_event": 0.001016,
+      "ratio": 1.3435,
+      "mannwhitney_p": 0.0
+    },
+    "oos": {
+      "n_event": 208,
+      "n_non_event": 198,
+      "median_event": 0.000724,
+      "median_non_event": 0.00078,
+      "ratio": 0.929,
+      "mannwhitney_p": 0.4782
+    }
+  },
+  "long_horizon_descriptive": {
+    "cum2y->r20": {
+      "n": 88,
+      "hits": 48,
+      "hit_rate": 0.5455,
+      "p_binom": 0.2279
+    },
+    "cum2y->r60": {
+      "n": 29,
+      "hits": 18,
+      "hit_rate": 0.6207,
+      "p_binom": 0.1325
+    },
+    "cum_evt->r20": {
+      "n": 82,
+      "hits": 36,
+      "hit_rate": 0.439,
+      "p_binom": 0.8879
+    },
+    "cum_evt->r60": {
+      "n": 27,
+      "hits": 14,
+      "hit_rate": 0.5185,
+      "p_binom": 0.5
+    }
+  },
+  "direction_coverage": {
+    "event_days_with_features": 1416,
+    "dropped_no_surprise": 407,
+    "signal_none_conflict_or_empty": 240,
+    "signal_up": 385,
+    "signal_down": 384
+  }
+}
