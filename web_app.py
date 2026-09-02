@@ -13,6 +13,8 @@ from urllib.parse import urlparse
 from urllib.error import URLError
 from urllib.request import Request, urlopen
 
+from money import D, f2, f as fN
+
 
 ROOT = Path(__file__).resolve().parent
 WEB_ROOT = ROOT / "web"
@@ -20,6 +22,7 @@ DATA_DIR = ROOT / "data"
 STATE_FILE = DATA_DIR / "fx_workspace.json"
 RATES_CACHE_FILE = DATA_DIR / "rates_cache.json"
 FORECAST_SIGNALS_FILE = DATA_DIR / "forecast_signals.json"
+AUDIT_LOG_FILE = DATA_DIR / "audit_log.jsonl"
 BASE_CURRENCY = "CNY"
 
 # Serializes the read-modify-write of the JSON state file so concurrent
@@ -95,6 +98,14 @@ DEMO_STATE = {
 }
 
 
+# 风险类型只有这三个合法值。历史数据里出现过表外值（例如 export_order），
+# 那时 accounting_bucket 会静默落到公允价值变动科目——挂错科目还不报错。
+# 现在的做法是：新数据一律拒收表外值；老数据保留原样但显式标出来，
+# **不做猜测性映射**——把 export_order 猜成"合同/订单套保"会悄悄改掉会计科目。
+EXPOSURE_CATEGORIES = ("balance_sheet", "cash_flow", "order_contract")
+DEFAULT_CATEGORY = "cash_flow"
+
+
 FALLBACK_PAIR_RATES = {
     "USD": 7.15,
     "EUR": 7.72,
@@ -136,6 +147,50 @@ def save_state(state: dict) -> None:
     write_json(STATE_FILE, state)
 
 
+def append_audit(action: str, collection: str, record_id: str | None, before: dict | None, after: dict | None) -> dict:
+    """把一次改动追加进 append-only 日志。
+
+    只追加、不改写：状态文件是全量覆写的，改完就看不出改了什么、改前是什么。
+    这条日志是唯一能回答"谁在什么时候把哪条改成了什么"的地方，
+    写失败不能影响主流程（宁可少一条日志，也不能让用户存不进数据）。
+    """
+    entry = {
+        "at": now_iso(),
+        "action": action,
+        "collection": collection,
+        "id": record_id,
+        "before": before,
+        "after": after,
+    }
+    try:
+        AUDIT_LOG_FILE.parent.mkdir(parents=True, exist_ok=True)
+        with AUDIT_LOG_FILE.open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps(entry, ensure_ascii=False) + "\n")
+    except OSError:
+        pass
+    return entry
+
+
+def read_audit(limit: int = 50) -> list[dict]:
+    if not AUDIT_LOG_FILE.exists():
+        return []
+    rows: list[dict] = []
+    try:
+        with AUDIT_LOG_FILE.open("r", encoding="utf-8") as handle:
+            for line in handle:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    rows.append(json.loads(line))
+                except json.JSONDecodeError:
+                    # 单行坏了不能让整段历史读不出来
+                    continue
+    except OSError:
+        return []
+    return rows[-limit:][::-1]
+
+
 def merged_config(state: dict) -> dict:
     config = dict(DEFAULT_CONFIG)
     config.update(state.get("config", {}))
@@ -161,7 +216,7 @@ def pair_rates_from_payload(payload: dict, currencies: list[str]) -> dict[str, f
         if currency == BASE_CURRENCY:
             continue
         if currency in rates and float(rates[currency]) != 0:
-            pairs[currency] = round(cny / float(rates[currency]), 6)
+            pairs[currency] = fN(cny / float(rates[currency]), 6)
     return pairs
 
 
@@ -322,6 +377,10 @@ def exposure_category_for(exposures: list[dict], period: str, currency: str) -> 
     return max(score.items(), key=lambda item: item[1])[0]
 
 
+def known_category(category: str | None) -> bool:
+    return category in EXPOSURE_CATEGORIES
+
+
 def accounting_bucket(category: str, trade_date: str, due_date: str) -> str:
     same_month = period_from_date(trade_date) == period_from_date(due_date)
     if category in {"balance_sheet", "order_contract"} and same_month:
@@ -339,7 +398,7 @@ def scenario_rates_for(pair_rates: dict[str, float], config: dict) -> dict[str, 
         "custom": float(config.get("custom_scenario_shift_pct", 0.01)),
     }
     return {
-        name: {currency: round(float(rate) * (1 + shift), 6) for currency, rate in pair_rates.items()}
+        name: {currency: fN(float(rate) * (1 + shift), 6) for currency, rate in pair_rates.items()}
         for name, shift in shifts.items()
     }
 
@@ -359,17 +418,20 @@ def scenario_projection(
     rows = {}
     for name, rates in scenario_rates.items():
         scenario_rate = float(rates.get(currency, current))
-        exposure_pnl = net * (scenario_rate - current)
-        hedge_pnl = signed_recommendation(recommended["action"], recommended["recommended_amount"]) * (
-            scenario_rate - recommended["trade_rate"]
+        # 这几个数会出现在报表上、也是对账口径，所以用 Decimal 算，
+        # 见 money.py 里的范围说明。
+        move = D(scenario_rate) - D(current)
+        exposure_pnl = D(net) * move
+        hedge_pnl = D(signed_recommendation(recommended["action"], recommended["recommended_amount"])) * (
+            D(scenario_rate) - D(recommended["trade_rate"])
         )
         rows[name] = {
             "period": period,
             "currency": currency,
             "scenario_rate": scenario_rate,
-            "unrealized_exchange_gain_loss": round(exposure_pnl, 2),
-            recommended["accounting_bucket"]: round(hedge_pnl, 2),
-            "total_projected_gain_loss": round(exposure_pnl + hedge_pnl, 2),
+            "unrealized_exchange_gain_loss": f2(exposure_pnl),
+            recommended["accounting_bucket"]: f2(hedge_pnl),
+            "total_projected_gain_loss": f2(exposure_pnl + hedge_pnl),
         }
     return rows
 
@@ -408,13 +470,14 @@ def build_dashboard(state: dict, rates_cache: dict, forecast_doc: dict | None = 
                 "period": period,
                 "currency": currency,
                 "risk_category": category,
+                "risk_category_known": known_category(category),
                 "target_hedge_ratio": target_ratio,
-                "business_exposure": round(gross, 2),
-                "locked_exposure": round(hedged, 2),
-                "net_exposure": round(net, 2),
+                "business_exposure": f2(gross),
+                "locked_exposure": f2(hedged),
+                "net_exposure": f2(net),
                 "current_rate": rate,
                 "rate_available": rate_available,
-                "cny_risk": round(cny_risk, 2),
+                "cny_risk": f2(cny_risk),
                 # 仅作提示：阈值不参与建议金额的计算，见 README「风险阈值」一节
                 "over_risk_limit": bool(rate_available and risk_limit > 0 and cny_risk > risk_limit),
             }
@@ -422,9 +485,9 @@ def build_dashboard(state: dict, rates_cache: dict, forecast_doc: dict | None = 
         signal = forecast_signals.get(currency)
         multiplier, multiplier_reason = forecast_multiplier(signal, net)
         effective_ratio = target_ratio * multiplier
-        target_cover = abs(gross) * effective_ratio
-        covered = abs(hedged)
-        recommended_amount = max(0.0, target_cover - covered)
+        target_cover = D(abs(gross)) * D(effective_ratio)
+        covered = D(abs(hedged))
+        recommended_amount = float(max(D(0), target_cover - covered))
         action = action_for(config, net)
         bucket = accounting_bucket(category, now_iso()[:10], f"{period}-28")
 
@@ -449,10 +512,11 @@ def build_dashboard(state: dict, rates_cache: dict, forecast_doc: dict | None = 
                 {
                     "period": period,
                     "currency": currency,
-                    "net_exposure": round(net, 2),
-                    "recommended_amount": round(recommended_amount, 2),
+                    "net_exposure": f2(net),
+                    "recommended_amount": f2(recommended_amount),
                     "has_recommendation": recommended_amount > 0,
                     "accounting_bucket": bucket,
+                    "bucket_uncertain": not known_category(category),
                     "projection": projection,
                 }
             )
@@ -462,18 +526,19 @@ def build_dashboard(state: dict, rates_cache: dict, forecast_doc: dict | None = 
                 "period": period,
                 "currency": currency,
                 "risk_category": category,
-                "net_exposure": round(net, 2),
-                "business_exposure": round(gross, 2),
-                "covered_exposure": round(covered, 2),
+                "risk_category_known": known_category(category),
+                "net_exposure": f2(net),
+                "business_exposure": f2(gross),
+                "covered_exposure": f2(covered),
                 "current_rate": rate,
                 "trade_rate": rate,
-                "risk_cny": round(cny_risk, 2),
+                "risk_cny": f2(cny_risk),
                 "target_hedge_ratio": target_ratio,
-                "effective_hedge_ratio": round(effective_ratio, 4),
-                "forecast_multiplier": round(multiplier, 4),
+                "effective_hedge_ratio": fN(effective_ratio, 4),
+                "forecast_multiplier": fN(multiplier, 4),
                 "forecast_reason": multiplier_reason,
                 "forecast_signal": signal,
-                "recommended_amount": round(recommended_amount, 2),
+                "recommended_amount": f2(recommended_amount),
                 "action": action,
                 "accounting_bucket": bucket,
                 "plain_text": suggestion_text(currency, net, effective_ratio, recommended_amount, action),
@@ -498,6 +563,7 @@ def build_dashboard(state: dict, rates_cache: dict, forecast_doc: dict | None = 
         "scenario_totals": scenario_totals,
         "scenario_summary": scenario_summary,
         "backtest": backtest_rows,
+        "audit": read_audit(30),
         "forecast": forecast_doc,
         "plain_language": build_plain_language(
             net_rows, suggestions, backtest_rows, rates_cache, scenario_totals
@@ -558,20 +624,20 @@ def build_portfolio(net_rows: list[dict], suggestions: list[dict]) -> dict:
         gross = bucket["gross_cny"]
         rows.append(
             {
-                **{key: round(value, 2) for key, value in bucket.items() if key != "currency"},
+                **{key: f2(value) for key, value in bucket.items() if key != "currency"},
                 "currency": bucket["currency"],
-                "locked_ratio": round(bucket["locked_cny"] / gross, 4) if gross else 0.0,
+                "locked_ratio": fN(bucket["locked_cny"] / gross, 4) if gross else 0.0,
             }
         )
 
     gross_total = sum(row["gross_cny"] for row in rows)
     locked_total = sum(row["locked_cny"] for row in rows)
     return {
-        "gross_exposure_cny": round(gross_total, 2),
-        "locked_cny": round(locked_total, 2),
-        "net_exposure_cny": round(sum(row["net_cny"] for row in rows), 2),
-        "recommended_cny": round(sum(row["recommended_cny"] for row in rows), 2),
-        "locked_ratio": round(locked_total / gross_total, 4) if gross_total else 0.0,
+        "gross_exposure_cny": f2(gross_total),
+        "locked_cny": f2(locked_total),
+        "net_exposure_cny": f2(sum(row["net_cny"] for row in rows)),
+        "recommended_cny": f2(sum(row["recommended_cny"] for row in rows)),
+        "locked_ratio": fN(locked_total / gross_total, 4) if gross_total else 0.0,
         "currency_count": len(rows),
         "period_count": len({row["period"] for row in net_rows}),
         "leg_count": len(net_rows),
@@ -604,10 +670,10 @@ def aggregate_scenarios(
             hedge_pnl += leg
             bucket_totals[bucket] += leg
         totals[name] = {
-            "unrealized_exchange_gain_loss": round(exposure_pnl, 2),
-            "hedge_pnl": round(hedge_pnl, 2),
-            "total_projected_gain_loss": round(exposure_pnl + hedge_pnl, 2),
-            "by_bucket": {key: round(value, 2) for key, value in sorted(bucket_totals.items())},
+            "unrealized_exchange_gain_loss": f2(exposure_pnl),
+            "hedge_pnl": f2(hedge_pnl),
+            "total_projected_gain_loss": f2(exposure_pnl + hedge_pnl),
+            "by_bucket": {key: f2(value) for key, value in sorted(bucket_totals.items())},
             "leg_count": len(scenario_rows),
         }
     return totals
@@ -634,31 +700,31 @@ def build_backtest(exposures: list[dict], hedges: list[dict], settlements: list[
         # 否则这一行看不出是已结算还是估的。
         actual_rate = settled_rate if settled else market_rate
         gross = exposure_totals.get(key, 0.0)
-        hedge_effect = 0.0
+        hedge_effect = D(0)
         locked_detail = []
         for hedge in locked_by_key.get(key, []):
             locked_rate = float(hedge.get("locked_rate", 0))
             signed = signed_hedge(hedge)
-            effect = signed * (actual_rate - locked_rate)
+            effect = D(signed) * (D(actual_rate) - D(locked_rate))
             hedge_effect += effect
             locked_detail.append(
                 {
                     "amount": float(hedge.get("amount", 0)),
                     "action": hedge.get("action"),
                     "locked_rate": locked_rate,
-                    "effect_cny": round(effect, 2),
+                    "effect_cny": f2(effect),
                 }
             )
         rows.append(
             {
                 "period": period,
                 "currency": currency,
-                "business_exposure": round(gross, 2),
-                "actual_rate": round(actual_rate, 6),
-                "reference_rate": round(market_rate, 6),
+                "business_exposure": f2(gross),
+                "actual_rate": fN(actual_rate, 6),
+                "reference_rate": fN(market_rate, 6),
                 "settled": settled,
                 "rate_basis": "settlement" if settled else "market_estimate",
-                "hedge_effect_cny": round(hedge_effect, 2),
+                "hedge_effect_cny": f2(hedge_effect),
                 "locked_detail": locked_detail,
                 "plain_text": (
                     f"{period} {currency}: 实际汇率 {actual_rate:.6f}，参考汇率 {market_rate:.6f}，"
@@ -757,31 +823,47 @@ class FxRiskHandler(BaseHTTPRequestHandler):
                 state = ensure_state()
                 if self.path == "/api/exposures":
                     validate_exposure(body)
-                    state.setdefault("exposures", []).append(add_id(body))
+                    row = add_id(body)
+                    state.setdefault("exposures", []).append(row)
                     save_state(state)
+                    append_audit("create", "exposures", row.get("id"), None, row)
                     self.send_json({"ok": True})
                     return
                 if self.path == "/api/hedges":
                     validate_hedge(body)
-                    state.setdefault("hedges", []).append(add_id(body))
+                    row = add_id(body)
+                    state.setdefault("hedges", []).append(row)
                     save_state(state)
+                    append_audit("create", "hedges", row.get("id"), None, row)
                     self.send_json({"ok": True})
                     return
                 if self.path == "/api/settlements":
                     validate_settlement(body)
-                    state.setdefault("settlements", []).append(add_id(body))
+                    row = add_id(body)
+                    state.setdefault("settlements", []).append(row)
                     save_state(state)
+                    append_audit("create", "settlements", row.get("id"), None, row)
                     self.send_json({"ok": True})
                     return
                 if self.path == "/api/config":
                     merged = dict(DEFAULT_CONFIG)
+                    before = dict(merged)
+                    before.update(state.get("config", {}))
                     merged.update(state.get("config", {}))
                     merged.update(body)
                     state["config"] = merged
                     save_state(state)
+                    changed = {
+                        key: {"from": before.get(key), "to": value}
+                        for key, value in merged.items()
+                        if before.get(key) != value
+                    }
+                    if changed:
+                        append_audit("update", "config", None, before, changed)
                     self.send_json({"ok": True, "config": merged})
                     return
                 if self.path == "/api/reset-demo":
+                    append_audit("reset", "workspace", None, state, DEMO_STATE)
                     save_state(DEMO_STATE)
                     self.send_json({"ok": True})
                     return
@@ -795,12 +877,21 @@ class FxRiskHandler(BaseHTTPRequestHandler):
         if len(parts) == 3 and parts[0] == "api":
             collection = {"exposures": "exposures", "hedges": "hedges", "settlements": "settlements"}.get(parts[1])
             if collection:
+                record_id = parts[2]
                 with STATE_LOCK:
                     state = ensure_state()
-                    before = len(state.get(collection, []))
-                    state[collection] = [row for row in state.get(collection, []) if row.get("id") != parts[2]]
+                    rows = state.get(collection, [])
+                    removed = [row for row in rows if row.get("id") == record_id]
+                    if not removed:
+                        # 删一条不存在的记录以前也回 200/deleted:0，等于把
+                        # "前端拿着过期 id" 这种 bug 悄悄咽掉。
+                        self.send_json({"ok": False, "error": "record not found"}, status=404)
+                        return
+                    state[collection] = [row for row in rows if row.get("id") != record_id]
                     save_state(state)
-                self.send_json({"ok": True, "deleted": before - len(state[collection])})
+                for row in removed:
+                    append_audit("delete", collection, record_id, row, None)
+                self.send_json({"ok": True, "deleted": len(removed)})
                 return
         self.send_error(404)
 
@@ -838,6 +929,16 @@ def validate_exposure(row: dict) -> None:
         raise ValueError("exposure direction must be receipt or payment")
     if float(row["amount"]) <= 0:
         raise ValueError("amount must be positive")
+    category = row.get("category") or DEFAULT_CATEGORY
+    if not known_category(category):
+        raise ValueError(
+            "exposure category must be one of " + "/".join(EXPOSURE_CATEGORIES) + f"; got {category!r}"
+        )
+    row["category"] = category
+    probability = float(row.get("probability", 1) or 1)
+    if not 0 < probability <= 1:
+        raise ValueError("probability must be in (0, 1]")
+    row["probability"] = probability
 
 
 def validate_hedge(row: dict) -> None:
@@ -860,9 +961,20 @@ def validate_settlement(row: dict) -> None:
         raise ValueError("actual_rate must be positive")
 
 
+class FxRiskServer(ThreadingHTTPServer):
+    """默认 request_queue_size=5，十来个并发请求就会有连接被内核直接重置
+    （客户端看到的是 ConnectionResetError，不是超时，很难猜）。
+    单用户本地工具平时碰不到，但页面一次刷新就要打好几个接口，
+    把 backlog 放大是一行的事。"""
+
+    daemon_threads = True
+    allow_reuse_address = True
+    request_queue_size = 64
+
+
 def run(host: str, port: int) -> None:
     ensure_state()
-    server = ThreadingHTTPServer((host, port), FxRiskHandler)
+    server = FxRiskServer((host, port), FxRiskHandler)
     print(f"FX risk web app running at http://{host}:{port}")
     server.serve_forever()
 

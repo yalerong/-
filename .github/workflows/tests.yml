@@ -1,0 +1,21 @@
+name: tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  unittest:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      # 全部测试只用标准库，Prophet 那条链路的测试自己会跳过，
+      # 所以这里刻意不装依赖——装了反而掩盖"核心逻辑零依赖"这个约束。
+      - name: 运行测试
+        run: python -m unittest discover -p "test_*.py" -v
+      - name: demo 与实现对拍
+        run: python demo/parity_check.py

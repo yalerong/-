@@ -60,11 +60,36 @@ http://127.0.0.1:8877
 - **统计区**：`驾驶舱`（组合层面的四个数：业务敞口合计 / 已锁合计 / 剩余敞口 / 待锁建议，
   外加分币种明细）、`净敞口`、`损益场景`。
 - **工作区**：`待锁汇`（有几条建议侧栏会标几）、`录入`、`明细`、`到期与回测`。
-- **其他**：`汇率与缓存`、`配置`。
+- **其他**：`变更记录`、`汇率与缓存`、`配置`。
 
 驾驶舱的合计口径要注意一条：**各币种折成人民币后取绝对值相加，不同币种之间不互相抵消**。
 净收美元和净付欧元是两个独立的风险，凑在一起算净额会把风险做小。同一币种同一期间的
 收付已经在净敞口里抵过了。
+
+## 改动留痕
+
+每一次新增、删除、改配置、恢复样例，都会往 `data/audit_log.jsonl` 追加一行，
+记下时间、动作、对象、改之前和改之后。这个文件**只追加、不改写**——
+状态文件 `data/fx_workspace.json` 是整份覆写的，改完就看不出改了什么、
+改前是什么，这条日志是唯一能回答的地方。页面上的「变更记录」显示最近 30 条。
+
+日志写失败不会影响主流程（宁可少一条日志，也不能让数据存不进去）。
+这个文件不进仓库。
+
+## 数据校验
+
+- 风险类型只接受 `balance_sheet` / `cash_flow` / `order_contract` 三个值，
+  表外值一律 400 拒收。历史数据里如果有表外值（例如 `export_order`），
+  页面会标「未知类目」并说明会计科目按公允价值变动兜底——**不做猜测性映射**，
+  猜错等于悄悄改掉会计科目。
+- 概率必须落在 `(0, 1]`。
+- 删除一条不存在的记录返回 404，不再是 200 + `deleted: 0`。
+
+## 金额取整
+
+金额走 `money.py` 的 Decimal 取整：**四舍五入**（`round-half-up`），不是 Python
+内置 `round()` 的银行家舍入。范围有限——汇率、聚合中间量仍是浮点，
+详见 `money.py` 顶部的说明。
 
 ## 页面区域说明
 
@@ -444,13 +469,33 @@ python -m forecast.prophet_forecast --pair USDCNY
 python -m forecast.monthly_backtest --pair USDCNY
 ```
 
+## 两套实现的关系
+
+仓库里有两条独立的敞口计算路径，**这是有意的**：
+
+- `web_app.py`：网页工作台，状态在 `data/fx_workspace.json`，独有预测折扣闸门；
+- `fx_risk_simulator.py`：离线 CLI，输入是 case JSON，独有远期价、坏账率、
+  情景对账校验（`validate_case`）。
+
+两边各写了一遍"按方向定符号 → 按期间和币种汇总"。谁改了一边忘了另一边，
+数字就会悄悄分叉，所以配了 `test_engine_parity.py`：同一份敞口喂给两条路径，
+钉住聚合结果必须一致。和 `demo/parity_check.py` 是同一个思路——
+允许存在两份实现，但必须配一道闸门。
+
 ## 测试命令
 
 ```powershell
-python -m unittest test_fx_risk_simulator.py test_web_app.py
+# 全部测试（含 HTTP 层、两套实现对拍、金额取整）
+python -m unittest discover -p "test_*.py"
+
+# demo 页与实现的闸门逻辑对拍
+python demo/parity_check.py
+
 python -m py_compile fx_risk_simulator.py fx_risk_gui.py web_app.py
 node --check web\app.js
 ```
+
+push 和 PR 会由 GitHub Actions（`.github/workflows/tests.yml`）自动跑上面前两条。
 
 ## 项目结构
 

@@ -68,6 +68,7 @@ function renderDashboard(data) {
   renderHedgeTable(data.hedges || []);
   renderScenarioRows(data.scenario_rows || [], data.scenario_totals || {});
   renderList("backtestRows", data.backtest || [], renderBacktest);
+  renderAudit(data.audit || []);
   renderConfig(data.config || {});
 }
 
@@ -300,7 +301,7 @@ function renderNetExposure(rows) {
     tr.innerHTML = `
       <td>${row.period}</td>
       <td>${row.currency}</td>
-      <td>${riskCategoryName(row.risk_category)}</td>
+      <td>${riskCategoryCell(row.risk_category, row.risk_category_known)}</td>
       <td>${ratioText(row.target_hedge_ratio)}</td>
       <td>${money(row.business_exposure)}</td>
       <td>${money(row.locked_exposure)}</td>
@@ -468,7 +469,7 @@ function renderExposureTable(rows) {
     },
     { render: (row) => money(row.amount), cls: "num" },
     { render: (row) => ratioText(row.probability == null ? 1 : row.probability), cls: "num" },
-    { render: (row) => escapeHtml(riskCategoryName(row.category)) },
+    { render: (row) => riskCategoryCell(row.category) },
     { render: (row) => escapeHtml(row.description || "—"), cls: "col-note" },
   ], "exposures", "还没有敞口，先到「录入」里添加一笔。");
 }
@@ -507,6 +508,55 @@ function renderBacktest(row) {
   return div;
 }
 
+const AUDIT_ACTIONS = {
+  create: "新增",
+  delete: "删除",
+  update: "修改",
+  reset: "恢复样例",
+};
+
+const AUDIT_COLLECTIONS = {
+  exposures: "敞口",
+  hedges: "锁汇",
+  settlements: "到期汇率",
+  config: "配置",
+  workspace: "整个工作区",
+};
+
+function auditSummary(row) {
+  if (row.collection === "config") {
+    const changes = Object.entries(row.after || {})
+      .map(([key, value]) => `${escapeHtml(key)}：${escapeHtml(value.from)} → ${escapeHtml(value.to)}`);
+    return changes.length ? changes.join("；") : "无实际变化";
+  }
+  if (row.collection === "workspace") return "工作区被重置为样例数据";
+  const body = row.after || row.before || {};
+  const parts = [body.due_date, body.currency, body.amount == null ? null : money(body.amount)]
+    .filter(Boolean)
+    .map(escapeHtml);
+  const note = body.description ? `（${escapeHtml(body.description)}）` : "";
+  return parts.join(" ") + note;
+}
+
+function renderAudit(rows) {
+  const body = document.getElementById("auditRows");
+  const scope = document.getElementById("auditScope");
+  if (!body) return;
+  if (scope) scope.textContent = rows.length ? `最近 ${rows.length} 条` : "";
+  if (!rows.length) {
+    body.innerHTML = '<tr><td colspan="4" class="empty-row">还没有任何改动。</td></tr>';
+    return;
+  }
+  body.innerHTML = rows.map((row) => `
+    <tr>
+      <td>${escapeHtml(fmtTime(row.at))}</td>
+      <td>${escapeHtml(AUDIT_ACTIONS[row.action] || row.action)}</td>
+      <td>${escapeHtml(AUDIT_COLLECTIONS[row.collection] || row.collection)}</td>
+      <td class="col-note" title="${escapeHtml(auditSummary(row).replace(/<[^>]*>/g, ""))}">${auditSummary(row)}</td>
+    </tr>
+  `).join("");
+}
+
 function renderConfig(config) {
   const form = document.getElementById("configForm");
   form.rate_api_url.value = config.rate_api_url || "";
@@ -519,12 +569,22 @@ function renderConfig(config) {
   form.custom_scenario_shift_pct.value = config.custom_scenario_shift_pct ?? 0.01;
 }
 
+const RISK_CATEGORY_NAMES = {
+  balance_sheet: "资产负债表套保",
+  cash_flow: "现金流套保",
+  order_contract: "合同/订单套保",
+};
+
 function riskCategoryName(value) {
-  return {
-    balance_sheet: "资产负债表套保",
-    cash_flow: "现金流套保",
-    order_contract: "合同/订单套保",
-  }[value] || value || "-";
+  return RISK_CATEGORY_NAMES[value] || value || "-";
+}
+
+// 表外类目是历史数据留下的，会计科目只能兜底到公允价值变动，
+// 这里显式标出来而不是装作认识它。
+function riskCategoryCell(value, known) {
+  const known_ = known === undefined ? value in RISK_CATEGORY_NAMES : known;
+  if (known_) return escapeHtml(riskCategoryName(value));
+  return `${escapeHtml(value || "-")} <span class="warn-tag" title="不是合法的风险类型，会计科目按公允价值变动兜底；建议删除后重新录入">未知类目</span>`;
 }
 
 function bucketName(value) {
