@@ -575,6 +575,35 @@ v2 里还有一个"字面通过但被否决"的例子：`rF` 三条预注册条�
 [`docs/event-driven-plan-v2.md`](docs/event-driven-plan-v2.md)、
 [`docs/event-driven-results-v2.md`](docs/event-driven-results-v2.md)。
 
+## 在线演示怎么来的
+
+<https://fx-demo.pages.dev/> 上跑的**就是这套前端代码**，不是另写的一份宣传页——
+另写一份的话两边一定会漂。
+
+工作台本身是 Python 服务，静态托管跑不了，所以 `demo/build_static.py` 做三件事：
+
+1. 用一份合成的演示数据在本地跑一遍 `build_dashboard`，把结果烘成 JSON；
+2. 原样复制 `web/index.html` / `app.js` / `styles.css`；
+3. 在 app.js 之前插一段垫片接管 `fetch("/api/…")`——读接口返回烘好的数据，
+   写接口一律 403 并给出可读提示。
+
+演示数据是刻意排过的，每种值得看的情形都留了一个：未来期间（远期贴水看得见、
+中性情景不为 0）、录了实际发生额的已结算期间（价量分解 + 超额套保警告）、
+只锁一半的敞口、没有本地行情序列的币种（诚实显示「无月均基准」）、
+冻过的方案加一次参数漂移。
+
+`test_static_build.py` 钉住这些：垫片确实注入了、且排在 app.js 之前。
+这个脚本靠字符串锚点改 HTML，锚点一变垫片就**静默**不注入——
+本地构建照样成功，部署上去才发现页面在打真实的 `/api` 然后白屏。
+
+重新部署：
+
+```powershell
+python demo/build_static.py .\demo\_static
+npx wrangler pages deploy .\demo\_static --project-name fx-demo --branch main
+```
+
+
 ## 工程约束
 
 几条被 CI 真正守住的约束，不是写在注释里的口号：
