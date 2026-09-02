@@ -4,7 +4,7 @@
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>外汇风险与锁汇工作台</title>
-    <link rel="stylesheet" href="/web/styles.css?v=8" />
+    <link rel="stylesheet" href="/web/styles.css?v=9" />
   </head>
   <body>
     <header class="topbar">
@@ -148,14 +148,52 @@
           </form>
         </section>
 
-        <section id="details" class="grid two">
+        <section id="details">
           <section id="exposureListPanel" class="panel">
-            <h2>敞口明细</h2>
-            <div id="exposureRows" class="list"></div>
+            <div class="panel-title">
+              <h2>敞口明细</h2>
+              <span class="meta" id="exposureCount"></span>
+            </div>
+            <div class="table-wrap">
+              <table class="detail-table">
+                <thead>
+                  <tr>
+                    <th>到期日</th>
+                    <th>币种</th>
+                    <th>方向</th>
+                    <th>金额</th>
+                    <th>概率</th>
+                    <th>风险类型</th>
+                    <th>备注</th>
+                    <th class="col-action"></th>
+                  </tr>
+                </thead>
+                <tbody id="exposureRows"></tbody>
+              </table>
+            </div>
           </section>
           <section class="panel">
-            <h2>锁汇明细</h2>
-            <div id="hedgeRows" class="list"></div>
+            <div class="panel-title">
+              <h2>锁汇明细</h2>
+              <span class="meta" id="hedgeCount"></span>
+            </div>
+            <div class="table-wrap">
+              <table class="detail-table">
+                <thead>
+                  <tr>
+                    <th>交易日</th>
+                    <th>到期日</th>
+                    <th>币种</th>
+                    <th>操作</th>
+                    <th>金额</th>
+                    <th>锁定汇率</th>
+                    <th>备注</th>
+                    <th class="col-action"></th>
+                  </tr>
+                </thead>
+                <tbody id="hedgeRows"></tbody>
+              </table>
+            </div>
           </section>
         </section>
 
@@ -207,6 +245,6 @@
       </main>
     </div>
 
-    <script src="/web/app.js?v=8"></script>
+    <script src="/web/app.js?v=9"></script>
   </body>
 </html>

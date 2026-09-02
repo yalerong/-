@@ -522,3 +522,48 @@ th {
     border-bottom-color: var(--accent);
   }
 }
+
+/* ===== 明细表 ===== */
+#details .panel + .panel {
+  margin-top: 16px;
+}
+
+.detail-table td.num {
+  text-align: right;
+  font-variant-numeric: tabular-nums;
+}
+
+.detail-table th.col-action,
+.detail-table td.col-action {
+  width: 1%;
+  text-align: right;
+  white-space: nowrap;
+}
+
+.detail-table td.col-note {
+  color: var(--muted);
+  max-width: 260px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.detail-table .empty-row {
+  color: var(--muted);
+  text-align: center;
+  padding: 18px 0;
+}
+
+.row-delete {
+  padding: 3px 10px;
+  font-size: 12px;
+  background: transparent;
+  color: var(--danger);
+  border: 1px solid #e3c2bd;
+  border-radius: 5px;
+  cursor: pointer;
+}
+
+.row-delete:hover {
+  background: #fdf2f0;
+}

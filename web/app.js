@@ -64,8 +64,8 @@ function renderDashboard(data) {
   renderPortfolio(data.portfolio || {});
   renderSuggestions(data.suggestions || []);
   renderNetExposure(data.net_exposures || []);
-  renderList("exposureRows", data.exposures || [], renderExposure);
-  renderList("hedgeRows", data.hedges || [], renderHedge);
+  renderExposureTable(data.exposures || []);
+  renderHedgeTable(data.hedges || []);
   renderScenarioRows(data.scenario_rows || [], data.scenario_totals || {});
   renderList("backtestRows", data.backtest || [], renderBacktest);
   renderConfig(data.config || {});
@@ -414,44 +414,79 @@ function renderList(id, rows, renderItem) {
   rows.forEach((row) => box.appendChild(renderItem(row)));
 }
 
-function itemShell(row, title, detail, collection) {
-  const div = document.createElement("div");
-  div.className = "item";
-  div.innerHTML = `
-    <strong>${title}</strong>
-    <p>${detail}</p>
-    <p class="meta">${row.description || ""}</p>
-    <button type="button" class="secondary">删除</button>
-  `;
-  div.querySelector("button").addEventListener("click", async () => {
-    if (!window.confirm(`确认删除这条记录？此操作无法撤销。\n${title}`)) return;
-    await runAction("正在删除...", async () => {
-      await api(`/api/${collection}/${row.id}`, { method: "DELETE" });
-      await loadDashboard();
-      showStatus("已删除。");
+function escapeHtml(value) {
+  return String(value == null ? "" : value).replace(/[&<>"']/g, (ch) => ({
+    "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;",
+  }[ch]));
+}
+
+function byDueDate(a, b) {
+  const left = `${a.due_date || ""}${a.currency || ""}`;
+  const right = `${b.due_date || ""}${b.currency || ""}`;
+  return left.localeCompare(right);
+}
+
+// 明细用表格：字段各占一列，能横向比对，不再把信息塞进句子里。
+function renderDetailTable(tbodyId, countId, rows, columns, collection, emptyText) {
+  const body = document.getElementById(tbodyId);
+  const count = document.getElementById(countId);
+  if (!body) return;
+  if (count) count.textContent = rows.length ? `共 ${rows.length} 条` : "";
+  if (!rows.length) {
+    body.innerHTML = `<tr><td colspan="${columns.length + 1}" class="empty-row">${emptyText}</td></tr>`;
+    return;
+  }
+  body.innerHTML = "";
+  rows.slice().sort(byDueDate).forEach((row) => {
+    const tr = document.createElement("tr");
+    const cells = columns.map((col) => {
+      const value = col.render(row);
+      return `<td${col.cls ? ` class="${col.cls}"` : ""}>${value}</td>`;
+    }).join("");
+    tr.innerHTML = `${cells}<td class="col-action"><button type="button" class="row-delete">删除</button></td>`;
+    const title = `${row.due_date || ""} ${row.currency || ""} ${money(row.amount)}`;
+    tr.querySelector("button").addEventListener("click", async () => {
+      if (!window.confirm(`确认删除这条记录？此操作无法撤销。\n${title}`)) return;
+      await runAction("正在删除...", async () => {
+        await api(`/api/${collection}/${row.id}`, { method: "DELETE" });
+        await loadDashboard();
+        showStatus("已删除。");
+      });
     });
+    body.appendChild(tr);
   });
-  return div;
 }
 
-function renderExposure(row) {
-  const direction = row.direction === "receipt" ? "未来收外币" : "未来付外币";
-  return itemShell(
-    row,
-    `${row.due_date} ${row.currency} ${money(row.amount)}`,
-    `${direction}，${riskCategoryName(row.category)}，概率 ${ratioText(row.probability || 1)}`,
-    "exposures",
-  );
+function renderExposureTable(rows) {
+  renderDetailTable("exposureRows", "exposureCount", rows, [
+    { render: (row) => escapeHtml(row.due_date) },
+    { render: (row) => escapeHtml(row.currency) },
+    {
+      render: (row) => row.direction === "receipt"
+        ? '<span class="net-tag net-in">收</span> 未来收外币'
+        : '<span class="net-tag net-out">付</span> 未来付外币',
+    },
+    { render: (row) => money(row.amount), cls: "num" },
+    { render: (row) => ratioText(row.probability == null ? 1 : row.probability), cls: "num" },
+    { render: (row) => escapeHtml(riskCategoryName(row.category)) },
+    { render: (row) => escapeHtml(row.description || "—"), cls: "col-note" },
+  ], "exposures", "还没有敞口，先到「录入」里添加一笔。");
 }
 
-function renderHedge(row) {
-  const action = row.action === "sell_foreign" ? "卖出外币/远期结汇" : "买入外币/远期购汇";
-  return itemShell(
-    row,
-    `${row.due_date} ${row.currency} ${money(row.amount)}`,
-    `${action}，锁定汇率 ${row.locked_rate}`,
-    "hedges",
-  );
+function renderHedgeTable(rows) {
+  renderDetailTable("hedgeRows", "hedgeCount", rows, [
+    { render: (row) => escapeHtml(row.trade_date) },
+    { render: (row) => escapeHtml(row.due_date) },
+    { render: (row) => escapeHtml(row.currency) },
+    {
+      render: (row) => row.action === "sell_foreign"
+        ? "卖出外币/远期结汇"
+        : "买入外币/远期购汇",
+    },
+    { render: (row) => money(row.amount), cls: "num" },
+    { render: (row) => escapeHtml(row.locked_rate), cls: "num" },
+    { render: (row) => escapeHtml(row.description || "—"), cls: "col-note" },
+  ], "hedges", "还没有锁汇记录。");
 }
 
 function renderBacktest(row) {
