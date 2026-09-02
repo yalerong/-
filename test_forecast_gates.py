@@ -5,6 +5,12 @@ import unittest
 import web_app
 from forecast import pipeline, trend_gate
 
+try:  # trend_gate 的 EMA/ATR 计算依赖 pandas，核心逻辑不依赖
+    import pandas  # noqa: F401
+    HAS_PANDAS = True
+except ImportError:
+    HAS_PANDAS = False
+
 
 def bt(**overrides):
     base = {
@@ -64,6 +70,7 @@ class ClassifyTierTest(unittest.TestCase):
         self.assertGreater(pipeline.binom_p_one_sided(20, 40), 0.5)
 
 
+@unittest.skipUnless(HAS_PANDAS, "trend_gate 需要 pandas；不装依赖的那条 CI 作业跳过这组")
 class TrendGateTest(unittest.TestCase):
     def _series(self, drift):
         # 单调漂移 + 小幅锯齿，确保 ATR 非零

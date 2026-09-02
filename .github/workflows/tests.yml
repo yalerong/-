@@ -6,16 +6,35 @@ on:
   pull_request:
 
 jobs:
-  unittest:
+  # 两条作业是有意分开的：
+  # core 守住"核心逻辑零第三方依赖"这个约束——装了依赖就看不出来了；
+  # full 才是完整覆盖，包括依赖 pandas 的趋势闸门。
+  core:
+    name: 零依赖核心
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-      # 全部测试只用标准库，Prophet 那条链路的测试自己会跳过，
-      # 所以这里刻意不装依赖——装了反而掩盖"核心逻辑零依赖"这个约束。
-      - name: 运行测试
+      - name: 确认没装任何第三方包
+        run: |
+          python -c "import sys; sys.exit(0)"
+          pip list --format=freeze | grep -viE "^(pip|setuptools|wheel)=" && exit 1 || true
+      - name: 运行测试（依赖 pandas 的组会自动跳过）
         run: python -m unittest discover -p "test_*.py" -v
       - name: demo 与实现对拍
         run: python demo/parity_check.py
+
+  full:
+    name: 完整套件
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: 安装趋势闸门需要的依赖
+        run: pip install pandas
+      - name: 运行全部测试
+        run: python -m unittest discover -p "test_*.py" -v
