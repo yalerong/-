@@ -15,6 +15,7 @@
 from __future__ import annotations
 
 import json
+import re
 import shutil
 import sys
 from datetime import date, timedelta
@@ -25,6 +26,27 @@ sys.path.insert(0, str(ROOT))
 
 import web_app  # noqa: E402
 import plans  # noqa: E402
+
+
+def guard_output_dir(out: Path) -> None:
+    """构建前会 rmtree 输出目录，所以先确认它不是个能删坏东西的路径。
+
+    `python demo/build_static.py .` 会把 out 解析成仓库根目录，
+    直接删掉整个 checkout；传 `demo` 会删掉这个脚本自己和演示页源文件。
+    这类参数看着都挺自然，不能靠使用者小心。
+    """
+    protected = {ROOT, ROOT / "demo", ROOT / "web", ROOT / "data", ROOT / "docs",
+                 ROOT / "events", ROOT / "forecast", ROOT / ".git"}
+    if out in protected:
+        raise SystemExit(f"拒绝：{out} 是源目录，构建会先删空它")
+    if out == Path(out.anchor):
+        raise SystemExit(f"拒绝：{out} 是盘符/根目录")
+    if ROOT == out or ROOT.is_relative_to(out):
+        raise SystemExit(f"拒绝：{out} 包含着仓库本身，删它会删掉源码")
+    if out.exists() and any(
+        (out / name).exists() for name in ("web_app.py", "build_static.py", ".git")
+    ):
+        raise SystemExit(f"拒绝：{out} 看起来是源目录（里面有源文件），不是构建产物目录")
 
 
 def month_end(d: date) -> str:
@@ -48,7 +70,10 @@ def demo_state(today: date) -> dict:
         "config": dict(
             web_app.DEFAULT_CONFIG,
             default_hedge_ratio=0.8,
-            enterprise_type="export",
+            # 这份数据同时有收和付，只能用 comprehensive。
+            # 用 export 的话 action_for 会给净付的欧元敞口也返回 sell_foreign，
+            # 于是卡片文案写着"买入外币"、按钮填进去的却是卖出。
+            enterprise_type="comprehensive",
             interest_rates={"CNY": 0.019, "USD": 0.043, "EUR": 0.025},
         ),
         "monthly_average_rates": {f"{settled[:7]}:USD": 7.12},
@@ -79,6 +104,49 @@ def demo_state(today: date) -> dict:
              "actual_rate": 7.05, "actual_amount": 620000,
              "description": "到期结算，客户只提了一部分货"},
         ],
+    }
+
+
+def demo_forecast(today: date) -> dict:
+    """跟着构建日期滚动的合成信号。
+
+    不能用签入的 data/forecast_signals.json：那份是固定月份的，
+    而演示敞口的期间是从 today 往后推的，两者会错开——
+    拿一段已经结束的预测去影响另一个到期日的建议，演示站上会出现
+    自相矛盾的东西。（信号覆盖不到该期间时应该退回 1.0×，
+    这个闸门缺口本身另行处理。）
+    """
+    months = []
+    year, month = today.year, today.month
+    rate = 7.18
+    for _ in range(8):
+        month += 1
+        if month > 12:
+            year, month = year + 1, 1
+        rate += 0.012
+        months.append({"month": f"{year}-{month:02d}", "rate": round(rate, 4), "dir": "up"})
+    return {
+        "generated_at": f"{today.isoformat()}T00:00:00Z",
+        "horizon_months": len(months),
+        "base_currency": "CNY",
+        "signals": {
+            "USD": {
+                "pair": "USDCNY", "current": 7.18,
+                "current_month": today.strftime("%Y-%m"),
+                "forecast": months, "direction": "up",
+                # 预测幅度约 1.3%，刻意压在 MAPE 之下——
+                # 演示站默认停在"预测有利但被信噪比闸门挡掉"这一格
+                "mape": 0.018, "direction_accuracy": 0.62, "n_test": 30, "tier": "support",
+            },
+            "EUR": {
+                "pair": "EURCNY", "current": 7.72,
+                "current_month": today.strftime("%Y-%m"),
+                "forecast": [dict(m, rate=round(7.72 + i * 0.02, 4))
+                             for i, m in enumerate(months)],
+                "direction": "up", "mape": 0.063, "direction_accuracy": 0.42,
+                "n_test": 30, "tier": "reject",
+            },
+        },
     }
 
 
@@ -122,6 +190,7 @@ BANNER = """<div class="demo-banner">
   <strong>只读演示</strong>
   <span>数据全部合成，不含任何真实企业的头寸或对手方；汇率为演示用固定值。
   按钮和表单可以点，但不会真的改数据。</span>
+  <span class="demo-asof">数据截至 __ASOF__</span>
   <a href="/method">看方法与研究结论 →</a>
   <a href="https://github.com/yalerong/FX-Hedge-Lab">源码</a>
 </div>
@@ -142,6 +211,7 @@ BANNER_CSS = """
 .demo-banner strong { color: var(--accent-dark); }
 .demo-banner span { flex: 1 1 420px; color: var(--muted); }
 .demo-banner a { color: var(--accent-dark); font-weight: 600; }
+.demo-banner .demo-asof { flex: 0 0 auto; color: var(--muted); font-family: var(--mono, monospace); }
 """
 
 
@@ -150,8 +220,9 @@ def main() -> int:
     today = date.today()
 
     state = demo_state(today)
+    forecast = demo_forecast(today)
     dashboard = web_app.build_dashboard(
-        state, DEMO_RATES, forecast_doc=web_app.load_forecast_signals(), today=today
+        state, DEMO_RATES, forecast_doc=forecast, today=today
     )
     # 冻一份方案进去，这样「方案存档」和参数漂移在演示站上也是活的
     plan = dict(plans.freeze(dashboard, "上月冻结的方案", f"{today.isoformat()}T00:00:00Z"),
@@ -159,7 +230,7 @@ def main() -> int:
     state["plans"] = [plan]
     state["config"] = dict(state["config"], default_hedge_ratio=0.7)  # 制造一次参数漂移
     dashboard = web_app.build_dashboard(
-        state, DEMO_RATES, forecast_doc=web_app.load_forecast_signals(), today=today
+        state, DEMO_RATES, forecast_doc=forecast, today=today
     )
     dashboard["audit"] = [
         {"at": f"{today.isoformat()}T02:10:00Z", "action": "update", "collection": "config",
@@ -171,6 +242,7 @@ def main() -> int:
          "id": "d3", "before": None, "after": state["exposures"][2]},
     ]
 
+    guard_output_dir(out)
     if out.exists():
         shutil.rmtree(out)
     (out / "web").mkdir(parents=True)
@@ -181,7 +253,14 @@ def main() -> int:
 
     html = (ROOT / "web" / "index.html").read_text(encoding="utf-8")
     shim = SHIM.replace("__STATE__", json.dumps(dashboard, ensure_ascii=False))
-    html = html.replace("<body>", "<body>\n" + BANNER, 1)
+    banner = BANNER.replace("__ASOF__", today.isoformat())
+    html, banner_count = re.subn(r"<body>", "<body>\n" + banner.replace("\\", "\\\\"), html, count=1)
+    if banner_count != 1:
+        # 只读横幅是这个站唯一说明"数据是合成的"的地方，
+        # 静默丢掉比构建失败严重得多
+        raise SystemExit("没能插入只读横幅：<body> 锚点变了")
+    if '<script src="/web/app.js' not in html:
+        raise SystemExit("没能插入垫片：app.js 的引用锚点变了")
     html = html.replace('<script src="/web/app.js', shim + '    <script src="/web/app.js', 1)
     html = html.replace(
         "<title>外汇风险与锁汇工作台</title>",
