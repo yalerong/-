@@ -345,9 +345,30 @@ def forecast_expected_move(signal: dict | None) -> float | None:
     return abs(final / current - 1)
 
 
-def forecast_multiplier(signal: dict | None, net: float) -> tuple[float, str | None]:
+def signal_covers_period(signal: dict | None, period: str | None) -> bool:
+    """信号的预测区间是否覆盖这个到期期间。
+
+    一份 4 月生成、到 10 月结束的预测，对一笔次年 3 月到期的敞口没有任何
+    发言权。以前不做这个检查，等于拿一段已经结束的预测去给不相干的
+    到期日打折扣。信号说不上话就该退回足额锁——和其余四道闸门一样，只降不升。
+    """
+    if not signal or not period:
+        return True
+    months = [row.get("month") for row in (signal.get("forecast") or []) if row.get("month")]
+    if not months:
+        return True
+    return min(months) <= period <= max(months)
+
+
+def forecast_multiplier(
+    signal: dict | None, net: float, period: str | None = None
+) -> tuple[float, str | None]:
     if not signal:
         return 1.0, None
+    if not signal_covers_period(signal, period):
+        months = [row.get("month") for row in (signal.get("forecast") or []) if row.get("month")]
+        span = f"{min(months)}~{max(months)}" if months else "空"
+        return 1.0, f"预测区间 {span} 覆盖不到 {period}，这段时间模型说不上话，按目标比例锁汇"
     tier = signal.get("tier")
     direction = signal.get("direction")
     unfavorable = (direction == "down") if net > 0 else (direction == "up")
@@ -412,12 +433,36 @@ def hedge_ratio_for(config: dict, period: str, currency: str) -> float:
 
 
 def action_for(config: dict, net: float) -> str:
+    """操作方向**只由净敞口决定**。
+
+    以前企业类型会盖掉净敞口：出口型企业的一笔欧元应付也会拿到
+    sell_foreign。而卡片文案 suggestion_text 是按净额符号写的，
+    于是出现"文案说买入外币、action 字段却是卖出"，点「按建议填入锁汇单」
+    填进去的是一笔加仓交易，情景损益里那条腿也算反了。
+
+    企业类型不该覆盖单笔敞口的方向——它顶多说明"我通常是收外币的"，
+    改成用来标出异常方向（见 direction_is_unexpected）。
+    """
+    if net > 0:
+        return "sell_foreign"
+    if net < 0:
+        return "buy_foreign"
+    # 没有净敞口时不会产生建议，这里只是给个确定的返回值
+    return "buy_foreign" if config.get("enterprise_type") == "import" else "sell_foreign"
+
+
+def direction_is_unexpected(config: dict, net: float) -> bool:
+    """净敞口方向和企业类型对不上——多半是录错了，值得提示一句。
+
+    出口型企业出现净付、进口型出现净收，都不是不可能（比如采购分支），
+    但足够反常，应该让人看一眼再确认，而不是被静默改掉方向。
+    """
     enterprise_type = config.get("enterprise_type", "comprehensive")
     if enterprise_type == "export":
-        return "sell_foreign"
+        return net < 0
     if enterprise_type == "import":
-        return "buy_foreign"
-    return "sell_foreign" if net > 0 else "buy_foreign"
+        return net > 0
+    return False
 
 
 def exposure_category_for(exposures: list[dict], period: str, currency: str) -> str:
@@ -591,6 +636,7 @@ def build_dashboard(
                 "risk_category": category,
                 "risk_category_known": known_category(category),
                 "past_due": past_due,
+                "direction_unexpected": direction_is_unexpected(config, net),
                 "target_hedge_ratio": target_ratio,
                 "business_exposure": f2(gross),
                 "locked_exposure": f2(hedged),
@@ -603,7 +649,7 @@ def build_dashboard(
             }
         )
         signal = forecast_signals.get(currency)
-        multiplier, multiplier_reason = forecast_multiplier(signal, net)
+        multiplier, multiplier_reason = forecast_multiplier(signal, net, period)
         effective_ratio = target_ratio * multiplier
         target_cover = D(abs(gross)) * D(effective_ratio)
         covered = D(abs(hedged))
@@ -669,6 +715,7 @@ def build_dashboard(
                 "forecast_signal": signal,
                 "recommended_amount": f2(recommended_amount),
                 "action": action,
+                "direction_unexpected": direction_is_unexpected(config, net),
                 "accounting_bucket": bucket,
                 "plain_text": suggestion_text(currency, net, effective_ratio, recommended_amount, action),
                 "scenario_projection": projection,
