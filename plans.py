@@ -14,15 +14,16 @@ from __future__ import annotations
 
 # 会影响建议金额的配置项。只比这些——改个汇率接口地址不算参数漂移。
 DECISION_KEYS = (
-    "enterprise_type",
     "default_hedge_ratio",
     "month_currency_hedge_ratios",
     "interest_rates",
     "forward_overrides",
 )
-# `strategy_type` 曾经在上面这张表里，但全仓没有任何计算读它，
-# 改它会误报"建议已变"，与这张表的定义自相矛盾，所以移出去。
-# 哪天它真的接进建议计算，再加回来。
+# `strategy_type` 和 `enterprise_type` 都曾经在上面这张表里。
+# 前者全仓没有任何计算读它；后者自从操作方向改由净敞口决定之后，
+# 只剩下"标出反常方向"这一个提示作用，不再影响任何金额。
+# 留在表里的话，把出口型改成进口型会把一份数字和操作完全相同的方案
+# 判成过期，与这张表"只含影响建议金额的字段"的定义自相矛盾。
 
 # 影响情景损益、但不影响建议金额的项，单独归一类
 SCENARIO_KEYS = (
@@ -86,14 +87,20 @@ def freeze(dashboard: dict, label: str | None, now_iso: str) -> dict:
 
 
 # 信号里只有这几项会改变折扣，存指纹而不是整个对象——
-# forecast 数组每月都变，拿它比会天天报"漂移"。
+# forecast 数组每月都变，拿整段去比会天天报"漂移"。
 SIGNAL_KEYS = ("tier", "direction", "mape", "n_test", "direction_accuracy")
 
 
 def _signal_fingerprint(signal: dict | None) -> dict | None:
     if not signal:
         return None
-    return {key: signal.get(key) for key in SIGNAL_KEYS}
+    fingerprint = {key: signal.get(key) for key in SIGNAL_KEYS}
+    # 预测区间也得进来：自从加了"覆盖不到该期间就不给折扣"这道闸门，
+    # 同样的档位和方向，只要区间挪了，折扣就可能从 0.5 跳回 1.0。
+    # 只存首尾两个月，不存整段——整段每次重跑都会变。
+    months = [row.get("month") for row in (signal.get("forecast") or []) if row.get("month")]
+    fingerprint["horizon"] = {"from": min(months), "to": max(months)} if months else None
+    return fingerprint
 
 
 def _diff_value(before, after) -> dict | None:
@@ -141,6 +148,10 @@ def drift(
             continue
         before = row.get("forecast_signal")
         after = _signal_fingerprint(signals.get(currency))
+        # 指纹的字段是会加的（比如后来加进来的 horizon）。老快照里没有的键
+        # 不参与比较，否则加一个字段就把所有历史方案判成过期。
+        if isinstance(before, dict) and isinstance(after, dict):
+            after = {key: after.get(key) for key in before}
         change = _diff_value(before, after)
         if change:
             signal_changed[currency] = change

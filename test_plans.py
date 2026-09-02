@@ -105,6 +105,59 @@ class PlanSnapshotTest(unittest.TestCase):
         self.assertEqual(result["signal_changed"], {})
         self.assertFalse(result["stale"])
 
+    def test_signal_horizon_change_alone_makes_the_plan_stale(self):
+        """档位方向都没变，只是预测区间挪了——折扣照样会从 0.5 跳回 1.0。
+
+        自从加了"覆盖不到该期间就不给折扣"这道闸门，区间本身就是决策输入，
+        指纹里不带它的话，建议金额变了而页面说"方案与当前一致"。
+        """
+        base = {"tier": "support", "direction": "up", "mape": 0.018,
+                "n_test": 30, "direction_accuracy": 0.62,
+                "forecast": [{"month": "2026-10", "rate": 7.3},
+                             {"month": "2026-11", "rate": 7.35}]}
+        plan = plans.freeze(
+            {"suggestions": [{
+                "period": "2026-11", "currency": "USD", "action": "sell_foreign",
+                "business_exposure": 1000, "covered_exposure": 0, "net_exposure": 1000,
+                "target_hedge_ratio": 0.8, "forecast_multiplier": 0.5,
+                "effective_hedge_ratio": 0.4, "recommended_amount": 400,
+                "forecast_signal": base,
+            }], "config": {}, "rates": {}},
+            None, "2026-05-12T00:00:00Z",
+        )
+        self.assertEqual(plan["rows"][0]["forecast_signal"]["horizon"],
+                         {"from": "2026-10", "to": "2026-11"})
+
+        # 同样的档位方向，区间整体后移
+        moved = dict(base, forecast=[{"month": "2027-05", "rate": 7.3},
+                                     {"month": "2027-06", "rate": 7.35}])
+        result = plans.drift(plan, {}, {}, {"USD": moved})
+        self.assertTrue(result["stale"], "区间挪了就该报过期")
+        self.assertEqual(result["signal_changed"]["USD"]["to"]["horizon"],
+                         {"from": "2027-05", "to": "2027-06"})
+
+    def test_old_fingerprints_are_compared_on_the_keys_they_have(self):
+        """指纹字段是会加的，老快照不该因为多出一个新键就永久过期。"""
+        plan = plans.freeze(dashboard(self.state), None, "2026-05-12T00:00:00Z")
+        raw = {"tier": "support", "direction": "up", "mape": 0.018,
+               "n_test": 30, "direction_accuracy": 0.62,
+               "forecast": [{"month": "2026-11", "rate": 7.3}]}
+        signals = {row["currency"]: raw for row in plan["rows"]}
+        for row in plan["rows"]:
+            # 模拟加 horizon 之前冻的快照：只有老的那几个键
+            row["forecast_signal"] = {key: raw[key] for key in plans.SIGNAL_KEYS}
+        result = plans.drift(plan, dict(web_app.DEFAULT_CONFIG), RATES["pair_rates"], signals)
+        self.assertEqual(result["signal_changed"], {})
+        self.assertFalse(result["stale"])
+
+    def test_enterprise_type_is_not_decision_drift(self):
+        """方向改由净敞口决定之后，企业类型只剩提示作用，不该判方案过期。"""
+        self.assertNotIn("enterprise_type", plans.DECISION_KEYS)
+        plan = plans.freeze(dashboard(self.state), None, "2026-05-12T00:00:00Z")
+        config = dict(web_app.DEFAULT_CONFIG, enterprise_type="import")
+        result = plans.drift(plan, config, RATES["pair_rates"])
+        self.assertFalse(result["stale"])
+
     def test_unused_strategy_type_is_not_decision_drift(self):
         """strategy_type 全仓没有任何计算读它，改它不该误报"建议已变"。"""
         self.assertNotIn("strategy_type", plans.DECISION_KEYS)

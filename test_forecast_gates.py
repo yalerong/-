@@ -70,6 +70,80 @@ class ClassifyTierTest(unittest.TestCase):
         self.assertGreater(pipeline.binom_p_one_sided(20, 40), 0.5)
 
 
+class SignalHorizonTest(unittest.TestCase):
+    """信号覆盖不到该期间就不该给折扣——和其余四道闸门一样，只降不升。"""
+
+    def signal(self, months):
+        return {
+            "tier": "support", "direction": "up", "mape": 0.005, "current": 7.0,
+            "forecast": [{"month": m, "rate": 7.0 + 0.05 * (i + 1)} for i, m in enumerate(months)],
+        }
+
+    def test_period_inside_the_horizon_gets_the_discount(self):
+        mult, reason = web_app.forecast_multiplier(
+            self.signal(["2026-10", "2026-11", "2026-12"]), 700000, "2026-11"
+        )
+        self.assertEqual(mult, 0.5)
+        self.assertIn("有利", reason)
+
+    def test_period_past_the_horizon_gets_no_discount(self):
+        # 一份到 2026-12 结束的预测，对 2027-03 到期的敞口没有发言权
+        mult, reason = web_app.forecast_multiplier(
+            self.signal(["2026-10", "2026-11", "2026-12"]), 700000, "2027-03"
+        )
+        self.assertEqual(mult, 1.0)
+        self.assertIn("覆盖不到", reason)
+        self.assertIn("2027-03", reason)
+
+    def test_period_before_the_horizon_gets_no_discount(self):
+        mult, _ = web_app.forecast_multiplier(
+            self.signal(["2026-10", "2026-11"]), 700000, "2026-08"
+        )
+        self.assertEqual(mult, 1.0)
+
+    def test_missing_period_or_forecast_keeps_old_behaviour(self):
+        # 没传期间、或者信号本来就没有逐月预测时，不因为这条闸门改变结果
+        self.assertEqual(web_app.forecast_multiplier(self.signal(["2026-11"]), 700000)[0], 0.5)
+        bare = {"tier": "support", "direction": "up", "mape": 0.005}
+        self.assertEqual(web_app.forecast_multiplier(bare, 700000, "2030-01")[0], 0.5)
+
+    def test_horizon_gate_only_lowers_never_raises(self):
+        # 信号不利时本来就是 1.0×，加了这条闸门也不能变成折扣
+        signal = dict(self.signal(["2026-11"]), direction="down")
+        self.assertEqual(web_app.forecast_multiplier(signal, 700000, "2030-01")[0], 1.0)
+
+
+class ActionDirectionTest(unittest.TestCase):
+    """操作方向只由净敞口决定，企业类型不能盖掉它。"""
+
+    def test_net_payable_always_buys_even_for_an_exporter(self):
+        config = {"enterprise_type": "export"}
+        self.assertEqual(web_app.action_for(config, -350000), "buy_foreign")
+
+    def test_net_receivable_always_sells_even_for_an_importer(self):
+        config = {"enterprise_type": "import"}
+        self.assertEqual(web_app.action_for(config, 700000), "sell_foreign")
+
+    def test_action_agrees_with_the_card_text(self):
+        # 以前文案说"买入外币/远期购汇"、action 却是 sell_foreign，
+        # 点「按建议填入锁汇单」会填一笔加仓交易
+        for enterprise_type in ("export", "import", "comprehensive"):
+            for net in (700000, -350000):
+                with self.subTest(enterprise_type=enterprise_type, net=net):
+                    config = {"enterprise_type": enterprise_type}
+                    action = web_app.action_for(config, net)
+                    text = web_app.suggestion_text("USD", net, 0.7, 1000, action)
+                    expected = "买入外币/远期购汇" if net < 0 else "卖出外币/远期结汇"
+                    self.assertIn(expected, text)
+                    self.assertEqual(action, "buy_foreign" if net < 0 else "sell_foreign")
+
+    def test_unexpected_direction_is_flagged_not_overridden(self):
+        self.assertTrue(web_app.direction_is_unexpected({"enterprise_type": "export"}, -1))
+        self.assertTrue(web_app.direction_is_unexpected({"enterprise_type": "import"}, 1))
+        self.assertFalse(web_app.direction_is_unexpected({"enterprise_type": "export"}, 1))
+        self.assertFalse(web_app.direction_is_unexpected({"enterprise_type": "comprehensive"}, -1))
+
+
 @unittest.skipUnless(HAS_PANDAS, "trend_gate 需要 pandas；不装依赖的那条 CI 作业跳过这组")
 class TrendGateTest(unittest.TestCase):
     def _series(self, drift):

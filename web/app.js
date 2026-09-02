@@ -224,7 +224,7 @@ function renderSuggestions(items) {
       ? `${ratioText(item.target_hedge_ratio)} → 实际 ${ratioText(item.effective_hedge_ratio)}`
       : ratioText(item.target_hedge_ratio);
     card.innerHTML = `
-      <strong>${item.period} ${item.currency}</strong>${item.past_due ? ' <span class="warn-tag" title="到期日已过，这笔敞口还挂在建议里，说明没有被处理掉">已过期</span>' : ""}
+      <strong>${item.period} ${item.currency}</strong>${item.past_due ? ' <span class="warn-tag" title="到期日已过，这笔敞口还挂在建议里，说明没有被处理掉">已过期</span>' : ""}${item.direction_unexpected ? ' <span class="warn-tag" title="净敞口方向和配置的企业类型相反，多半是录入有误，方向仍按净敞口走">方向异常</span>' : ""}
       <p>${item.plain_text}</p>
       ${renderForecastBlock(item)}
       <p class="meta">剩余敞口：${money(item.net_exposure)}，目标套保比例：${ratioLine}，损益科目：${bucketName(item.accounting_bucket)}</p>
@@ -346,7 +346,7 @@ function renderNetExposure(rows) {
       : "—";
     const tr = document.createElement("tr");
     tr.innerHTML = `
-      <td>${row.period}${row.past_due ? ' <span class="warn-tag" title="到期日已过">已过期</span>' : ""}</td>
+      <td>${row.period}${row.past_due ? ' <span class="warn-tag" title="到期日已过">已过期</span>' : ""}${row.direction_unexpected ? ' <span class="warn-tag" title="净敞口方向和配置的企业类型相反，多半是录入有误；方向仍按净敞口走">方向异常</span>' : ""}</td>
       <td>${row.currency}</td>
       <td>${riskCategoryCell(row.risk_category, row.risk_category_known)}</td>
       <td>${ratioText(row.target_hedge_ratio)}</td>
