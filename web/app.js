@@ -346,7 +346,7 @@ function renderNetExposure(rows) {
       : "—";
     const tr = document.createElement("tr");
     tr.innerHTML = `
-      <td>${row.period}${row.past_due ? ' <span class="warn-tag" title="到期日已过">已过期</span>' : ""}</td>
+      <td>${row.period}${row.past_due ? ' <span class="warn-tag" title="到期日已过">已过期</span>' : ""}${row.direction_unexpected ? ' <span class="warn-tag" title="净敞口方向和配置的企业类型相反，多半是录入有误；方向仍按净敞口走">方向异常</span>' : ""}</td>
       <td>${row.currency}</td>
       <td>${riskCategoryCell(row.risk_category, row.risk_category_known)}</td>
       <td>${ratioText(row.target_hedge_ratio)}</td>
