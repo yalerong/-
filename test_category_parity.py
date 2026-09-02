@@ -12,7 +12,6 @@
 from __future__ import annotations
 
 import json
-import re
 import shutil
 import subprocess
 import unittest
@@ -31,14 +30,13 @@ CASES = [
     {"booked": False, "probability": 0.99},
     {"booked": False, "probability": 0.5},
     {"booked": False, "probability": 0.01},
+    {"booked": False, "probability": 0.125},
+    {"booked": False, "probability": 0.005},
+    {"booked": False, "probability": 0.235},
     {"booked": False, "probability": None},
     {"probability": 1},
     {},
 ]
-
-
-def normalize(reason: str) -> str:
-    return re.sub(r"\d+%", "<pct>", reason)
 
 
 @unittest.skipUnless(shutil.which("node"), "需要 node 才能跑 JS 那一侧")
@@ -62,7 +60,11 @@ class CategoryParityTest(unittest.TestCase):
             with self.subTest(case=case):
                 py_category, py_reason = web_app.suggest_category(case)
                 self.assertEqual(py_category, js_category)
-                self.assertEqual(normalize(py_reason), normalize(js_reason))
+                # 原来这里先把百分数抹掉再比，等于把对拍唯一要保护的那个数字
+                # 排除在外——两侧取整规则确实不同（Python 的 %-格式是
+                # round-half-even，JS 的 Math.round 是 half-up），0.125 会
+                # 一个给 12% 一个给 13%，照样"通过"。现在逐字比。
+                self.assertEqual(py_reason, js_reason)
 
     def test_python_side_covers_every_branch(self):
         # 对拍只能保证两边一样，保证不了两边都对；分支本身也要钉住

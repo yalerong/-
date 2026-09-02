@@ -322,7 +322,7 @@ function sparkline(points, currentRate) {
 function fillHedgeFromSuggestion(item) {
   const form = document.getElementById("hedgeForm");
   form.trade_date.value = today();
-  form.due_date.value = `${item.period}-28`;
+  form.due_date.value = item.due_date || `${item.period}-28`;
   form.currency.value = item.currency;
   form.action.value = item.action;
   form.amount.value = item.recommended_amount;
@@ -561,7 +561,15 @@ function renderExposureTable(rows) {
     },
     { render: (row) => money(row.amount), cls: "num" },
     { render: (row) => ratioText(row.probability == null ? 1 : row.probability), cls: "num" },
-    { render: (row) => riskCategoryCell(row.category) },
+    {
+      render: (row) => {
+        const cell = riskCategoryCell(row.category);
+        const suggested = row.suggested_category;
+        if (!suggested || suggested === row.category) return cell;
+        return `${cell} <span class="warn-tag" title="${escapeHtml(row.suggestion_reason || "")}">推荐 ${escapeHtml(riskCategoryName(suggested))}</span>`;
+      },
+    },
+    { render: (row) => (row.booked ? "是" : "否") },
     { render: (row) => escapeHtml(row.description || "—"), cls: "col-note" },
   ], "exposures", "还没有敞口，先到「录入」里添加一笔。");
 }
@@ -607,6 +615,7 @@ const AUDIT_ACTIONS = {
   delete: "删除",
   update: "修改",
   reset: "恢复样例",
+  freeze: "冻结方案",
 };
 
 const AUDIT_COLLECTIONS = {
@@ -615,6 +624,7 @@ const AUDIT_COLLECTIONS = {
   settlements: "到期汇率",
   config: "配置",
   workspace: "整个工作区",
+  plans: "方案",
 };
 
 // 配置里有三个字典型的键（interest_rates / forward_overrides / scenario_shifts），
@@ -636,6 +646,14 @@ function auditSummary(row) {
     return changes.length ? changes.join("；") : "无实际变化";
   }
   if (row.collection === "workspace") return "工作区被重置为样例数据";
+  if (row.collection === "plans") {
+    // 方案的载荷里没有 due_date / currency / amount，走下面那个分支会得到空白，
+    // 于是"变更记录"答不出删掉的是哪一份方案。
+    const body = row.after || row.before || {};
+    const label = body.label ? escapeHtml(body.label) : "(未命名)";
+    const count = body.rows === undefined ? "" : `，${escapeHtml(auditValue(body.rows))} 条建议`;
+    return `${label}${count}`;
+  }
   const body = row.after || row.before || {};
   const parts = [body.due_date, body.currency, body.amount == null ? null : money(body.amount)]
     .filter(Boolean)
@@ -863,11 +881,18 @@ function ratioText(value) {
 
 function bindForms() {
   const exposureForm = document.getElementById("exposureForm");
-  ["probability", "booked", "category"].forEach((name) => {
+  // 顺序要紧：category 的处理必须先把 categoryTouched 置上再刷新提示。
+  // 反过来注册的话，用户第一次改下拉框时 updateCategoryHint 先跑，
+  // 那时 categoryTouched 还是 false，选择会被"跟随推荐"的逻辑弹回去——
+  // 用户得改两次才生效，正好跟"手动改过就再也不改"相反。
+  ["probability", "booked"].forEach((name) => {
     const field = exposureForm.elements[name];
     if (field) field.addEventListener("change", updateCategoryHint);
   });
-  exposureForm.elements.category.addEventListener("change", () => { categoryTouched = true; });
+  exposureForm.elements.category.addEventListener("change", () => {
+    categoryTouched = true;
+    updateCategoryHint();
+  });
   exposureForm.elements.probability.addEventListener("input", updateCategoryHint);
   updateCategoryHint();
 
@@ -883,8 +908,12 @@ function bindForms() {
 
   document.getElementById("exposureForm").addEventListener("submit", async (event) => {
     event.preventDefault();
-    categoryTouched = false;
     await submitForm(event.currentTarget, "/api/exposures", "敞口已保存", () => {
+      // submitForm 里会 form.reset()，把下拉框打回第一项、概率打回 1。
+      // 不同步重算的话，下一笔敞口会被静默存成 balance_sheet，
+      // 而页面上还挂着上一笔的提示。
+      categoryTouched = false;
+      updateCategoryHint();
       document.getElementById("exposureListPanel").scrollIntoView({ behavior: "smooth", block: "start" });
     });
   });

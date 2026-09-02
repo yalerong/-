@@ -145,6 +145,84 @@ class VarianceTest(unittest.TestCase):
         self.assertLess(var["volume_variance_cny"], 0)
 
 
+class VarianceNominalTest(unittest.TestCase):
+    def test_probability_haircut_is_not_reported_as_volume_variance(self):
+        """概率 60% 的订单全额兑现，不该被报成"多发生 40%"的量差收益。
+
+        套保规模按期望值（金额 × 概率）定是对的，但用户填的实际发生额是
+        真实结算金额。两者直接相减等于把概率折扣算成了业绩。
+        """
+        state = copy.deepcopy(web_app.DEMO_STATE)
+        state["exposures"] = [{
+            "id": "e1", "due_date": "2026-06-30", "currency": "USD",
+            "amount": 1000000, "direction": "receipt", "category": "order_contract",
+            "probability": 0.6,
+        }]
+        state["hedges"] = []
+        state["settlements"] = [{
+            "id": "s1", "due_date": "2026-06-30", "currency": "USD",
+            "actual_rate": 7.2, "actual_amount": 1000000,
+        }]
+        state["monthly_average_rates"] = {"2026-06:USD": 7.2}
+        row = next(r for r in dashboard(state)["backtest"] if r["currency"] == "USD")
+        var = row["benchmark"]["variance"]
+
+        # 计划敞口按名义金额 100 万，不是 60 万
+        self.assertEqual(var["planned_notional"], 1000000)
+        self.assertEqual(var["volume_gap"], 0)
+        self.assertEqual(var["volume_variance_cny"], 0)
+
+
+class NaturalOffsetScopeTest(unittest.TestCase):
+    def test_offset_only_happens_inside_a_period(self):
+        """六月净收美元、七月净付美元，是期限错配不是天然对冲。
+
+        六月那天照样全额敞着，跨期间相加把它算成"抵消"会把风险抹平。
+        """
+        state = copy.deepcopy(web_app.DEMO_STATE)
+        state["exposures"] = [
+            {"id": "e1", "due_date": "2026-06-30", "currency": "USD", "amount": 1000000,
+             "direction": "receipt", "category": "cash_flow", "probability": 1},
+            {"id": "e2", "due_date": "2026-07-31", "currency": "USD", "amount": 1000000,
+             "direction": "payment", "category": "cash_flow", "probability": 1},
+        ]
+        state["hedges"] = []
+        portfolio = dashboard(state)["portfolio"]
+        rate = RATES["pair_rates"]["USD"]
+
+        self.assertAlmostEqual(portfolio["net_exposure_cny"], 2000000 * rate, places=2)
+        self.assertAlmostEqual(portfolio["net_after_offset_cny"], 2000000 * rate, places=2)
+        self.assertEqual(portfolio["natural_offset_cny"], 0)
+
+    def test_offset_inside_one_period_still_counts(self):
+        state = copy.deepcopy(web_app.DEMO_STATE)
+        state["exposures"] = [
+            {"id": "e1", "due_date": "2026-06-30", "currency": "USD", "amount": 1000000,
+             "direction": "receipt", "category": "cash_flow", "probability": 1},
+            {"id": "e2", "due_date": "2026-06-15", "currency": "EUR", "amount": 500000,
+             "direction": "payment", "category": "cash_flow", "probability": 1},
+        ]
+        state["hedges"] = []
+        portfolio = dashboard(state)["portfolio"]
+        # 同一期间内两个币种方向相反，净额小于绝对值合计
+        self.assertLess(portfolio["net_after_offset_cny"], portfolio["net_exposure_cny"])
+        self.assertGreater(portfolio["natural_offset_cny"], 0)
+
+    def test_natural_offset_is_never_negative(self):
+        state = copy.deepcopy(web_app.DEMO_STATE)
+        state["exposures"] = [{
+            "id": "e1", "due_date": "2026-06-30", "currency": "USD", "amount": 1000000,
+            "direction": "receipt", "category": "cash_flow", "probability": 1,
+        }]
+        state["hedges"] = [{
+            "id": "h1", "trade_date": "2026-05-12", "due_date": "2026-06-30",
+            "currency": "USD", "amount": 1500000, "action": "sell_foreign", "locked_rate": 7.18,
+        }]
+        portfolio = dashboard(state)["portfolio"]
+        self.assertGreaterEqual(portfolio["natural_offset_cny"], 0)
+        self.assertGreaterEqual(portfolio["net_after_offset_cny"], 0)
+
+
 class CategorySuggestionTest(unittest.TestCase):
     def test_booked_items_are_balance_sheet(self):
         category, reason = web_app.suggest_category({"booked": True, "probability": 1})
@@ -159,6 +237,15 @@ class CategorySuggestionTest(unittest.TestCase):
         category, reason = web_app.suggest_category({"probability": 0.6})
         self.assertEqual(category, "cash_flow")
         self.assertIn("60%", reason)
+
+    def test_backend_annotates_every_saved_exposure(self):
+        """后端也要算推荐，绕过浏览器的 API 客户端才拿得到。"""
+        row = {"due_date": "2026-09-30", "currency": "USD", "amount": 100,
+               "direction": "receipt", "probability": 0.5, "category": "balance_sheet"}
+        web_app.validate_exposure(row)
+        self.assertEqual(row["suggested_category"], "cash_flow")
+        self.assertIn("50%", row["suggestion_reason"])
+        self.assertIs(row["booked"], False)
 
     def test_suggestion_is_always_a_legal_category(self):
         for row in ({}, {"probability": None}, {"probability": "bad"}, {"booked": False}):

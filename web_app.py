@@ -13,7 +13,7 @@ from urllib.parse import urlparse
 from urllib.error import URLError
 from urllib.request import Request, urlopen
 
-from money import D, f2, f as fN
+from money import D, f2, f as fN, q
 import benchmarks
 import forwards
 import plans
@@ -184,23 +184,40 @@ def append_audit(action: str, collection: str, record_id: str | None, before: di
     return entry
 
 
+# 只读文件尾部这么多字节。日志只追加不截断，每次刷新面板都整份读一遍的话，
+# 开销会随历史线性增长；reset 那种条目还会带整个工作区快照，放大得更快。
+AUDIT_TAIL_BYTES = 256 * 1024
+
+
 def read_audit(limit: int = 50) -> list[dict]:
     if not AUDIT_LOG_FILE.exists():
         return []
-    rows: list[dict] = []
     try:
-        with AUDIT_LOG_FILE.open("r", encoding="utf-8") as handle:
-            for line in handle:
-                line = line.strip()
-                if not line:
-                    continue
-                try:
-                    rows.append(json.loads(line))
-                except json.JSONDecodeError:
-                    # 单行坏了不能让整段历史读不出来
-                    continue
+        with AUDIT_LOG_FILE.open("rb") as handle:
+            handle.seek(0, 2)
+            size = handle.tell()
+            start = max(0, size - AUDIT_TAIL_BYTES)
+            handle.seek(start)
+            chunk = handle.read()
     except OSError:
         return []
+
+    text = chunk.decode("utf-8", errors="ignore")
+    lines = text.split("\n")
+    if start > 0 and lines:
+        # 从中间截断的第一行多半是半截的，丢掉
+        lines.pop(0)
+
+    rows: list[dict] = []
+    for line in lines[-(limit * 4):]:
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            rows.append(json.loads(line))
+        except json.JSONDecodeError:
+            # 单行坏了不能让整段历史读不出来
+            continue
     return rows[-limit:][::-1]
 
 
@@ -409,7 +426,10 @@ def suggest_category(row: dict) -> tuple[str, str]:
         probability = 1.0
     if probability >= 1:
         return "order_contract", "金额已确定但尚未入账，属于合同/订单套保"
-    return "cash_flow", f"发生概率 {probability:.0%}，属于高度可能的预期交易，走现金流套保"
+    # 不用 f"{p:.0%}"：那是 round-half-even，和 JS 的 Math.round（half-up）
+    # 在 0.125 / 0.005 这类值上会给出不同的百分比，对拍会假过。
+    percent = int(q(probability * 100, 0))
+    return "cash_flow", f"发生概率 {percent}%，属于高度可能的预期交易，走现金流套保"
 
 
 def known_category(category: str | None) -> bool:
@@ -533,6 +553,10 @@ def build_dashboard(
         target_ratio = hedge_ratio_for(config, period, currency)
         category = exposure_category_for(exposures, period, currency)
         # 远期结汇不是按即期价成交的，交易价要用远期价
+        # 建议单据的到期日 = 该期间月末。远期定价、会计科目判断、
+        # 前端预填的锁汇单必须全部用这同一个日期，否则定价的合约
+        # 和实际下的合约不是一张。
+        due_date = forwards.period_end_iso(period)
         fwd = forwards.forward_rate(rate, currency, period, config, today=today)
         trade_rate = fN(fwd["rate"], 6)
         # 到期日已过的敞口还留在建议里，说明它没被处理掉——不自动删，但要标出来
@@ -562,7 +586,7 @@ def build_dashboard(
         covered = D(abs(hedged))
         recommended_amount = float(max(D(0), target_cover - covered))
         action = action_for(config, net)
-        bucket = accounting_bucket(category, now_iso()[:10], f"{period}-28")
+        bucket = accounting_bucket(category, now_iso()[:10], due_date)
         # 远期结汇不是按即期价成交的，交易价要用远期价
 
         # 情景损益对每一行净敞口都算：建议金额为 0 时套保腿为 0，
@@ -610,6 +634,7 @@ def build_dashboard(
                 "forward_rate": trade_rate,
                 "forward_points": fN(fwd["points"], 6),
                 "forward_basis": fwd["basis"],
+                "due_date": due_date,
                 "past_due": past_due,
                 "forward_note": fwd["note"],
                 "tenor_years": fN(fwd["tenor_years"], 4),
@@ -691,6 +716,7 @@ def build_portfolio(net_rows: list[dict], suggestions: list[dict]) -> dict:
                 "gross_cny": 0.0,
                 "locked_cny": 0.0,
                 "net_cny": 0.0,
+                "added_risk_cny": 0.0,
                 "recommended_cny": 0.0,
                 "periods": 0,
             },
@@ -703,15 +729,19 @@ def build_portfolio(net_rows: list[dict], suggestions: list[dict]) -> dict:
         rate = float(row["current_rate"])
         gross = float(row["business_exposure"])
         locked = float(row["locked_exposure"])
-        # 只有方向相反的锁汇才算"锁掉了"，而且最多锁到敞口本身那么多。
-        # 直接取 abs(locked) 的话，同向的锁汇（那不是套保，是加仓）会被算成覆盖，
-        # 结果是 已锁 + 剩余 ≠ 业务敞口、剩余 > 业务敞口、覆盖率虚高。
-        offset = 0.0
-        if gross * locked < 0:
-            offset = min(abs(locked), abs(gross))
+        net = float(row["net_exposure"])
+        # 覆盖只算方向相反、且不超过敞口本身的那部分。
+        offset = min(abs(locked), abs(gross)) if gross * locked < 0 else 0.0
+        # 剩余风险直接取净敞口的绝对值。**不能**写成 |敞口| − 覆盖：
+        # 同向的"锁汇"是加仓（100 收 + 50 买入 = 净敞口 150）、
+        # 超额套保是反向裸头寸（100 收 + 150 卖出 = 净空 50），
+        # 两种情况下剩余风险都比敞口大。为了保住
+        # 「已锁 + 剩余 = 业务敞口」这个等式而把它们抹掉，等于低估风险。
+        # 等式只在 0 ≤ 覆盖 ≤ 敞口 时成立，这一点写在页面说明里。
         bucket["gross_cny"] += abs(gross) * rate
         bucket["locked_cny"] += offset * rate
-        bucket["net_cny"] += (abs(gross) - offset) * rate
+        bucket["net_cny"] += abs(net) * rate
+        bucket["added_risk_cny"] += max(0.0, abs(net) - (abs(gross) - offset)) * rate
         bucket["recommended_cny"] += recommended_by_key.get((row["period"], currency), 0.0) * rate
 
     rows = []
@@ -732,17 +762,22 @@ def build_portfolio(net_rows: list[dict], suggestions: list[dict]) -> dict:
     # 净额口径答"在所有币种同向变动这个假设下，真正还敞着的净额是多少"。
     # 后者正是专利背景技术点名的"不同币种间的天然对冲"，但它成立的前提
     # 恰恰是那个相关性为 1 的假设，所以只能并列、不能取代。
-    signed_net = sum(
-        float(row["net_exposure"]) * float(row["current_rate"])
-        for row in net_rows
-        if row.get("rate_available")
-    )
+    # 抵消只能发生在**同一期间内的不同币种之间**。
+    # 跨期间相加是错的：六月净收美元、七月净付美元，六月那天你照样全额敞着，
+    # 那是期限错配不是天然对冲。跨期间只能把各期间的净额取绝对值再加。
+    by_period: dict[str, float] = defaultdict(float)
+    for row in net_rows:
+        if row.get("rate_available"):
+            by_period[row["period"]] += float(row["net_exposure"]) * float(row["current_rate"])
+    signed_net = sum(abs(value) for value in by_period.values())
     return {
         "gross_exposure_cny": f2(gross_total),
         "locked_cny": f2(locked_total),
         "net_exposure_cny": f2(sum(row["net_cny"] for row in rows)),
+        # 同向持仓与超额套保带来的、超出"敞口未覆盖部分"的那块风险
+        "added_risk_cny": f2(sum(row["added_risk_cny"] for row in rows)),
         "net_after_offset_cny": f2(signed_net),
-        "natural_offset_cny": f2(sum(row["net_cny"] for row in rows) - abs(signed_net)),
+        "natural_offset_cny": f2(max(0.0, sum(row["net_cny"] for row in rows) - signed_net)),
         "recommended_cny": f2(sum(row["recommended_cny"] for row in rows)),
         "locked_ratio": fN(locked_total / gross_total, 4) if gross_total else 0.0,
         "currency_count": len(rows),
@@ -797,6 +832,16 @@ def build_backtest(
         (period_from_date(row.get("due_date", "")), row.get("currency", "").upper()): float(row.get("actual_rate", 0))
         for row in settlements
     }
+    # 计划敞口在这里要用**名义金额**，不能用概率加权后的值。
+    # signed_exposure 是 amount × probability（套保规模按期望值定是对的），
+    # 但用户填的 actual_amount 是真实结算金额。两者直接相减的话，
+    # 一笔概率 60% 的 100 万订单全额兑现，会被报成"多发生 40 万"的量差收益——
+    # 那是凭空造出来的。
+    nominal_by_key: dict[tuple[str, str], float] = defaultdict(float)
+    for row in exposures:
+        key = (period_from_date(row.get("due_date", "")), row.get("currency", "").upper())
+        nominal_by_key[key] += abs(float(row.get("amount", 0) or 0))
+
     actual_amount_by_key = {
         (period_from_date(row.get("due_date", "")), row.get("currency", "").upper()): float(row["actual_amount"])
         for row in settlements
@@ -842,7 +887,7 @@ def build_backtest(
         variance_row = None
         if benchmark:
             variance_row = variance.decompose(
-                planned_notional=benchmark["notional"],
+                planned_notional=nominal_by_key.get(key, benchmark["notional"]),
                 actual_notional=actual_amount_by_key.get(key),
                 realized_avg_rate=benchmark["realized_avg_rate"],
                 benchmark_rate=benchmark["average_rate"],
@@ -933,14 +978,21 @@ def build_plain_language(
         )
     if backtest_rows:
         lines.append("回测不是预测，它只是回答：如果按已记录锁汇执行，到期后相对实际汇率贡献了多少人民币。")
-        benched = [row for row in backtest_rows if row.get("benchmark")]
+        # 只统计真结算过的期间。未结算的行是拿当前市场价试算的，
+        # 把它算进"实际结汇均价 vs 记账基准"的合计里，等于用还没发生的事
+        # 去改一个号称是已实现结果的数。
+        benched = [row for row in backtest_rows if row.get("benchmark") and row.get("settled")]
+        pending_bench = [row for row in backtest_rows if row.get("benchmark") and not row.get("settled")]
         if benched:
             total = sum(row["benchmark"]["vs_benchmark_cny"] for row in benched)
             side = "好于" if total >= 0 else "差于"
             lines.append(
-                f"按司库口径再看一遍：{len(benched)} 个期间的结汇均价合计{side}当月月均汇率 "
+                f"按司库口径再看一遍：已结算的 {len(benched)} 个期间，结汇均价合计{side}当月月均汇率 "
                 f"{abs(total):,.2f} CNY。这才是财务考核用的比法。"
             )
+        if pending_bench:
+            names = "、".join(f"{row['period']} {row['currency']}" for row in pending_bench)
+            lines.append(f"{names} 还没结算，它们的司库口径是试算值，没有计入上面的合计。")
         pending = [row for row in backtest_rows if not row.get("settled")]
         if pending:
             names = "、".join(f"{row['period']} {row['currency']}" for row in pending)
@@ -991,6 +1043,9 @@ class FxRiskHandler(BaseHTTPRequestHandler):
             if self.path == "/api/rates/refresh":
                 self.send_json(load_rates(merged_config(ensure_state()), force=True))
                 return
+            # 冻结方案要用汇率，先在锁外把它取好：load_rates 缓存过期时会走
+            # 一次 urlopen(timeout=12)，在锁里等它等于把所有写请求堵住 12 秒。
+            plan_rates = load_rates(merged_config(ensure_state())) if self.path == "/api/plans" else None
             with STATE_LOCK:
                 state = ensure_state()
                 if self.path == "/api/exposures":
@@ -1035,7 +1090,7 @@ class FxRiskHandler(BaseHTTPRequestHandler):
                     self.send_json({"ok": True, "config": merged})
                     return
                 if self.path == "/api/plans":
-                    dashboard = build_dashboard(state, load_rates(merged_config(state)))
+                    dashboard = build_dashboard(state, plan_rates)
                     if not dashboard["suggestions"]:
                         raise ValueError("没有待锁汇建议，无法冻结方案")
                     plan = add_id(plans.freeze(dashboard, body.get("label"), now_iso()))
@@ -1046,8 +1101,11 @@ class FxRiskHandler(BaseHTTPRequestHandler):
                     self.send_json({"ok": True, "plan": plan})
                     return
                 if self.path == "/api/reset-demo":
-                    append_audit("reset", "workspace", None, state, DEMO_STATE)
+                    before_reset = state
                     save_state(DEMO_STATE)
+                    # 先写盘再记日志：反过来的话，写盘失败会在只追加的历史里
+                    # 永久留下一条"重置过"的假记录。
+                    append_audit("reset", "workspace", None, before_reset, DEMO_STATE)
                     self.send_json({"ok": True})
                     return
         except (ValueError, KeyError, json.JSONDecodeError) as exc:
@@ -1077,8 +1135,11 @@ class FxRiskHandler(BaseHTTPRequestHandler):
                         return
                     state[collection] = [row for row in rows if row.get("id") != record_id]
                     save_state(state)
-                for row in removed:
-                    append_audit("delete", collection, record_id, row, None)
+                    # 审计必须在锁内追加：放到锁外的话，另一个请求可能先提交
+                    # 并写完自己的日志，倒序展示出来就是"删除比它之后发生的
+                    # 改动还新"——日志顺序和实际状态变更顺序对不上。
+                    for row in removed:
+                        append_audit("delete", collection, record_id, row, None)
                 self.send_json({"ok": True, "deleted": len(removed)})
                 return
         self.send_error(404)
@@ -1135,6 +1196,12 @@ def validate_exposure(row: dict) -> None:
     if not 0 < probability <= 1:
         raise ValueError("probability must be in (0, 1]")
     row["probability"] = probability
+    row["booked"] = bool(row.get("booked"))
+    # 后端也算一遍推荐，这样绕过浏览器的 API 客户端同样能拿到，
+    # 而不是只有表单里有提示。
+    suggested, reason = suggest_category(row)
+    row["suggested_category"] = suggested
+    row["suggestion_reason"] = reason
 
 
 def validate_hedge(row: dict) -> None:

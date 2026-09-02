@@ -75,7 +75,10 @@ def _monthly_means(filename: str) -> dict[str, float]:
 
 def monthly_average(state: dict, period: str, currency: str) -> tuple[float | None, str | None]:
     """返回 (月均汇率, 来源说明)；取不到就是 (None, None)。"""
-    manual = (state.get("monthly_average_rates") or {})
+    # 两个位置都读：/api/config 会把用户提交的东西存进 state["config"]，
+    # 只读顶层的话，用户按说明填进配置的月均汇率会被静默忽略。
+    manual = dict((state.get("config") or {}).get("monthly_average_rates") or {})
+    manual.update(state.get("monthly_average_rates") or {})
     for key, needs_dict in ((f"{period}:{currency}", False), (period, True)):
         value = manual.get(key)
         # 只写月份不写币种的那种 key，值必须是 {币种: 汇率}。
@@ -139,7 +142,13 @@ def benchmark_row(
 
     hedged_notional = 0.0
     hedged_value = 0.0
-    for hedge in hedges:
+    # 锁汇总量超过敞口时要截断，那就必须定死"先用哪一笔"。
+    # 原来按记录插入顺序截断，两笔价格不同的锁汇换个录入次序，
+    # 结汇均价就变了——同样的经济头寸给出不同的绩效。按交易日先进先出。
+    for hedge in sorted(
+        hedges,
+        key=lambda row: (str(row.get("trade_date") or ""), str(row.get("id") or "")),
+    ):
         amount = offsetting_amount(hedge, gross_signed)
         rate = float(hedge.get("locked_rate", 0) or 0)
         if amount <= 0 or rate <= 0:

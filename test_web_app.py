@@ -220,11 +220,13 @@ class WebAppLogicTest(unittest.TestCase):
         self.assertEqual(past["suggestions"][0]["forward_basis"], "spot")
         self.assertEqual(past["scenario_totals"]["neutral"]["total_projected_gain_loss"], 0)
 
-    def test_portfolio_only_counts_hedges_that_actually_offset(self):
-        """方向相同的"锁汇"不是套保，是加仓，不能算进已锁。
+    def test_same_direction_position_raises_risk_instead_of_being_dropped(self):
+        """方向相同的"锁汇"是加仓：既不算覆盖，也不能从剩余风险里抹掉。
 
-        以前直接取 abs(locked_exposure)，结果 已锁 + 剩余 ≠ 业务敞口、
-        剩余 > 业务敞口、覆盖率还显示 41.67%——而真实覆盖是 0。
+        两次都踩过坑：第一版直接取 abs(locked) 当覆盖（覆盖率虚高）；
+        第二版为了保住「已锁 + 剩余 = 业务敞口」这个等式，把同向持仓整个
+        丢掉——100 收 + 50 买入的净敞口是 150，驾驶舱却报 100，低估风险。
+        等式只在 0 ≤ 覆盖 ≤ 敞口 时成立，不是不变量。
         """
         state = copy.deepcopy(web_app.DEMO_STATE)
         state["exposures"] = [{
@@ -239,16 +241,37 @@ class WebAppLogicTest(unittest.TestCase):
         }]
         portfolio = web_app.build_dashboard(state, self.rates, forecast_doc={})["portfolio"]
 
-        self.assertEqual(portfolio["locked_cny"], 0)
+        rate = self.rates["pair_rates"]["USD"]
+        self.assertEqual(portfolio["locked_cny"], 0, "反向的持仓不算覆盖")
         self.assertEqual(portfolio["locked_ratio"], 0)
-        self.assertAlmostEqual(
-            portfolio["locked_cny"] + portfolio["net_exposure_cny"],
-            portfolio["gross_exposure_cny"], places=2,
-            msg="已锁 + 剩余 必须等于 业务敞口",
-        )
-        self.assertLessEqual(portfolio["net_exposure_cny"], portfolio["gross_exposure_cny"])
+        # 净敞口 = 120 万收 + 50 万买入 = 170 万，比业务敞口还大
+        self.assertAlmostEqual(portfolio["net_exposure_cny"], 1700000 * rate, places=2)
+        self.assertGreater(portfolio["net_exposure_cny"], portfolio["gross_exposure_cny"])
+        self.assertAlmostEqual(portfolio["added_risk_cny"], 500000 * rate, places=2)
 
-    def test_portfolio_totals_stay_additive_with_a_proper_hedge(self):
+    def test_over_hedging_leaves_a_naked_opposite_position(self):
+        """锁过头 = 反向裸头寸，剩余风险不是 0。"""
+        state = copy.deepcopy(web_app.DEMO_STATE)
+        state["exposures"] = [{
+            "id": "e1", "due_date": "2026-06-30", "currency": "USD",
+            "amount": 1000000, "direction": "receipt", "category": "order_contract",
+            "probability": 1,
+        }]
+        state["hedges"] = [{
+            "id": "h1", "trade_date": "2026-05-12", "due_date": "2026-06-30",
+            "currency": "USD", "amount": 1500000, "action": "sell_foreign", "locked_rate": 7.18,
+        }]
+        portfolio = web_app.build_dashboard(state, self.rates, forecast_doc={})["portfolio"]
+        rate = self.rates["pair_rates"]["USD"]
+
+        # 覆盖最多算到敞口本身
+        self.assertAlmostEqual(portfolio["locked_cny"], 1000000 * rate, places=2)
+        # 多卖的 50 万是净空头，仍然是风险
+        self.assertAlmostEqual(portfolio["net_exposure_cny"], 500000 * rate, places=2)
+        self.assertAlmostEqual(portfolio["added_risk_cny"], 500000 * rate, places=2)
+
+    def test_totals_are_additive_only_when_hedges_are_proper(self):
+        # 正常套保（方向相反、不超额）下等式才成立
         portfolio = web_app.build_dashboard(
             web_app.DEMO_STATE, self.rates, forecast_doc={}
         )["portfolio"]
@@ -256,6 +279,7 @@ class WebAppLogicTest(unittest.TestCase):
             portfolio["locked_cny"] + portfolio["net_exposure_cny"],
             portfolio["gross_exposure_cny"], places=2,
         )
+        self.assertEqual(portfolio["added_risk_cny"], 0)
 
     def test_zero_probability_is_rejected_not_silently_promoted(self):
         """概率 0 以前被 `or 1` 悄悄换成 1，等于把已取消的订单按全额记进敞口。"""
