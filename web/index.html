@@ -4,7 +4,7 @@
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>外汇风险与锁汇工作台</title>
-    <link rel="stylesheet" href="/web/styles.css?v=9" />
+    <link rel="stylesheet" href="/web/styles.css?v=12" />
   </head>
   <body>
     <header class="topbar">
@@ -35,6 +35,7 @@
         </div>
         <div class="nav-group">
           <span class="nav-title">其他</span>
+          <a href="#audit" data-nav="audit">变更记录</a>
           <a href="#rates" data-nav="rates">汇率与缓存</a>
           <a href="#config" data-nav="config">配置</a>
         </div>
@@ -207,12 +208,39 @@
             <button type="submit">保存实际汇率</button>
           </form>
           <section class="panel">
-            <h2>回测结果</h2>
+            <div class="panel-title">
+              <h2>回测结果</h2>
+              <span class="meta">两个口径：对到期即期（交易员）与对月均汇率（司库）</span>
+            </div>
             <div id="backtestRows" class="list"></div>
           </section>
         </section>
 
         <!-- ==================== 其他 ==================== -->
+        <section id="audit" class="panel">
+          <div class="panel-title">
+            <h2>变更记录</h2>
+            <span class="meta" id="auditScope"></span>
+          </div>
+          <p class="notice">
+            只追加、不改写。状态文件是整份覆写的，改完就看不出改了什么；这条日志是唯一能回答
+            「谁在什么时候把哪条改成了什么」的地方，落盘在 <code>data/audit_log.jsonl</code>。
+          </p>
+          <div class="table-wrap">
+            <table class="detail-table">
+              <thead>
+                <tr>
+                  <th>时间</th>
+                  <th>动作</th>
+                  <th>对象</th>
+                  <th>内容</th>
+                </tr>
+              </thead>
+              <tbody id="auditRows"></tbody>
+            </table>
+          </div>
+        </section>
+
         <section id="rates" class="panel compact-panel">
           <div class="panel-title">
             <h2>汇率与缓存</h2>
@@ -245,6 +273,6 @@
       </main>
     </div>
 
-    <script src="/web/app.js?v=9"></script>
+    <script src="/web/app.js?v=12"></script>
   </body>
 </html>

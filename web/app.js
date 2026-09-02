@@ -59,6 +59,21 @@ async function loadDashboard() {
   renderDashboard(dashboard);
 }
 
+function scenarioAssumptionNote(uniform) {
+  if (uniform === false) return "";
+  return `
+    <div class="item warn-item">
+      <strong>情景假设：所有币种同幅同向变动</strong>
+      <p class="meta">
+        这等于假设币种之间相关性为 1。对"净收美元 + 净付欧元"这类组合，两边会天然对冲，
+        把合计风险算小——真实风险来自交叉汇率。要按币种分别设涨跌幅，
+        在配置的 <code>scenario_shifts</code> 里写，例如
+        <code>{"EUR": {"optimistic": -0.01}}</code>。
+      </p>
+    </div>
+  `;
+}
+
 function renderDashboard(data) {
   renderRateStatus(data);
   renderPortfolio(data.portfolio || {});
@@ -66,8 +81,9 @@ function renderDashboard(data) {
   renderNetExposure(data.net_exposures || []);
   renderExposureTable(data.exposures || []);
   renderHedgeTable(data.hedges || []);
-  renderScenarioRows(data.scenario_rows || [], data.scenario_totals || {});
+  renderScenarioRows(data.scenario_rows || [], data.scenario_totals || {}, data.scenario_uniform);
   renderList("backtestRows", data.backtest || [], renderBacktest);
+  renderAudit(data.audit || []);
   renderConfig(data.config || {});
 }
 
@@ -200,16 +216,40 @@ function renderSuggestions(items) {
       ? `${ratioText(item.target_hedge_ratio)} → 实际 ${ratioText(item.effective_hedge_ratio)}`
       : ratioText(item.target_hedge_ratio);
     card.innerHTML = `
-      <strong>${item.period} ${item.currency}</strong>
+      <strong>${item.period} ${item.currency}</strong>${item.past_due ? ' <span class="warn-tag" title="到期日已过，这笔敞口还挂在建议里，说明没有被处理掉">已过期</span>' : ""}
       <p>${item.plain_text}</p>
       ${renderForecastBlock(item)}
       <p class="meta">剩余敞口：${money(item.net_exposure)}，目标套保比例：${ratioLine}，损益科目：${bucketName(item.accounting_bucket)}</p>
-      <p class="meta">建议金额：${money(item.recommended_amount)}，交易汇率：${item.trade_rate}，人民币风险：${money(item.risk_cny)}</p>
+      <p class="meta">建议金额：${money(item.recommended_amount)}，交易汇率：${item.trade_rate}${forwardTag(item)}，人民币风险：${money(item.risk_cny)}</p>
+      ${forwardLine(item)}
       <button type="button">按建议填入锁汇单</button>
     `;
     card.querySelector("button").addEventListener("click", () => fillHedgeFromSuggestion(item));
     box.appendChild(card);
   });
+}
+
+const FORWARD_BASIS = {
+  quote: "银行报价",
+  cip: "利差推算",
+  spot: "即期兜底",
+};
+
+function forwardTag(item) {
+  if (!item.forward_basis) return "";
+  const cls = item.forward_basis === "spot" ? "warn-tag" : "chip";
+  return ` <span class="${cls}" title="${escapeHtml(item.forward_note || "")}">${FORWARD_BASIS[item.forward_basis] || item.forward_basis}</span>`;
+}
+
+// 远期结汇不是按即期价成交的，远期点是利差决定的，不是对走势的判断。
+function forwardLine(item) {
+  if (!item.forward_basis || item.spot_rate === undefined) return "";
+  if (item.forward_basis === "spot") {
+    return `<p class="meta">即期 ${item.spot_rate}，未取到远期价：${escapeHtml(item.forward_note || "")}</p>`;
+  }
+  const points = Number(item.forward_points || 0);
+  const word = points === 0 ? "持平" : points > 0 ? "升水" : "贴水";
+  return `<p class="meta">即期 ${item.spot_rate} → 远期 ${item.forward_rate}（${word} ${Math.abs(points).toFixed(6)}，期限 ${item.tenor_years} 年）</p>`;
 }
 
 function renderForecastBlock(item) {
@@ -298,9 +338,9 @@ function renderNetExposure(rows) {
       : "—";
     const tr = document.createElement("tr");
     tr.innerHTML = `
-      <td>${row.period}</td>
+      <td>${row.period}${row.past_due ? ' <span class="warn-tag" title="到期日已过">已过期</span>' : ""}</td>
       <td>${row.currency}</td>
-      <td>${riskCategoryName(row.risk_category)}</td>
+      <td>${riskCategoryCell(row.risk_category, row.risk_category_known)}</td>
       <td>${ratioText(row.target_hedge_ratio)}</td>
       <td>${money(row.business_exposure)}</td>
       <td>${money(row.locked_exposure)}</td>
@@ -351,7 +391,7 @@ function renderScenarioTotals(totals, legCount) {
   `;
 }
 
-function renderScenarioRows(entries, totals) {
+function renderScenarioRows(entries, totals, uniform) {
   const box = document.getElementById("scenarioRows");
   box.innerHTML = "";
   if (!entries.length) {
@@ -360,6 +400,7 @@ function renderScenarioRows(entries, totals) {
   }
   // 先给组合层面的总账，再给逐个期间/币种的明细。
   box.insertAdjacentHTML("beforeend", renderScenarioTotals(totals || {}, entries.length));
+  box.insertAdjacentHTML("beforeend", scenarioAssumptionNote(uniform));
   entries.forEach((item) => {
     const rows = Object.entries(item.projection || {}).map(([name, row]) => {
       const bucketValue = row[item.accounting_bucket] || 0;
@@ -468,7 +509,7 @@ function renderExposureTable(rows) {
     },
     { render: (row) => money(row.amount), cls: "num" },
     { render: (row) => ratioText(row.probability == null ? 1 : row.probability), cls: "num" },
-    { render: (row) => escapeHtml(riskCategoryName(row.category)) },
+    { render: (row) => riskCategoryCell(row.category) },
     { render: (row) => escapeHtml(row.description || "—"), cls: "col-note" },
   ], "exposures", "还没有敞口，先到「录入」里添加一笔。");
 }
@@ -501,10 +542,98 @@ function renderBacktest(row) {
   div.innerHTML = `
     <strong>${row.period} ${row.currency}</strong>${tag}
     <p>${row.plain_text}</p>
-    <p>锁汇贡献${settled ? "" : "（试算）"}：<span class="${cls}">${money(row.hedge_effect_cny)} CNY</span></p>
+    <p>锁汇贡献${settled ? "" : "（试算）"}：<span class="${cls}">${money(row.hedge_effect_cny)} CNY</span>
+      <span class="meta">（对到期即期，交易员口径）</span></p>
     <p class="meta">业务敞口 ${money(row.business_exposure)}，${rateLine}</p>
+    ${renderBenchmark(row.benchmark)}
   `;
   return div;
+}
+
+const AUDIT_ACTIONS = {
+  create: "新增",
+  delete: "删除",
+  update: "修改",
+  reset: "恢复样例",
+};
+
+const AUDIT_COLLECTIONS = {
+  exposures: "敞口",
+  hedges: "锁汇",
+  settlements: "到期汇率",
+  config: "配置",
+  workspace: "整个工作区",
+};
+
+// 配置里有三个字典型的键（interest_rates / forward_overrides / scenario_shifts），
+// 直接 String() 会渲染成 [object Object]——审计日志号称是唯一能回答
+// "把哪条改成了什么"的地方，偏偏对新加的这几个键答不上来。
+function auditValue(value) {
+  if (value === null || value === undefined) return "空";
+  if (typeof value === "object") {
+    const text = JSON.stringify(value);
+    return text.length > 120 ? text.slice(0, 117) + "…" : text;
+  }
+  return String(value);
+}
+
+function auditSummary(row) {
+  if (row.collection === "config") {
+    const changes = Object.entries(row.after || {})
+      .map(([key, value]) => `${escapeHtml(key)}：${escapeHtml(auditValue(value.from))} → ${escapeHtml(auditValue(value.to))}`);
+    return changes.length ? changes.join("；") : "无实际变化";
+  }
+  if (row.collection === "workspace") return "工作区被重置为样例数据";
+  const body = row.after || row.before || {};
+  const parts = [body.due_date, body.currency, body.amount == null ? null : money(body.amount)]
+    .filter(Boolean)
+    .map(escapeHtml);
+  const note = body.description ? `（${escapeHtml(body.description)}）` : "";
+  return parts.join(" ") + note;
+}
+
+function renderAudit(rows) {
+  const body = document.getElementById("auditRows");
+  const scope = document.getElementById("auditScope");
+  if (!body) return;
+  if (scope) scope.textContent = rows.length ? `最近 ${rows.length} 条` : "";
+  if (!rows.length) {
+    body.innerHTML = '<tr><td colspan="4" class="empty-row">还没有任何改动。</td></tr>';
+    return;
+  }
+  body.innerHTML = rows.map((row) => `
+    <tr>
+      <td>${escapeHtml(fmtTime(row.at))}</td>
+      <td>${escapeHtml(AUDIT_ACTIONS[row.action] || row.action)}</td>
+      <td>${escapeHtml(AUDIT_COLLECTIONS[row.collection] || row.collection)}</td>
+      <td class="col-note" title="${auditSummary(row).replace(/<[^>]*>/g, "")}">${auditSummary(row)}</td>
+    </tr>
+  `).join("");
+}
+
+// 司库口径：结汇均价 vs 当月月均汇率。企业财务按月均记账和考核，
+// 所以这才是甲方真正会问的比法；上面那个锁汇贡献比的是到期即期价。
+function renderBenchmark(bench) {
+  if (!bench) {
+    return '<p class="meta">无月均基准：这个币种没有本地行情序列，也没在配置里录入财务月均汇率。</p>';
+  }
+  const total = Number(bench.vs_benchmark_cny);
+  const cls = total >= 0 ? "positive" : "negative";
+  const word = total >= 0 ? "好于" : "差于";
+  const provisional = bench.settled === false
+    ? ' <span class="warn-tag" title="到期实际汇率还没录入，结汇均价和归因都是按当前市场价试算的">试算</span>'
+    : "";
+  return `
+    <div class="bench-block">
+      <p>司库口径${provisional}：结汇均价 <b>${bench.realized_avg_rate}</b>，当月月均 <b>${bench.average_rate}</b>，
+        合计<span class="${cls}">${word} ${money(Math.abs(total))} CNY</span></p>
+      <p class="meta">
+        拆开看：套保效应 ${money(bench.hedge_effect_cny)}（锁汇把价格从到期即期挪到了结汇均价）、
+        择时效应 ${money(bench.timing_effect_cny)}（市场自己从月均走到到期即期，跟锁不锁无关）。
+        套保覆盖 ${ratioText(bench.hedge_coverage)}，基准来源：${escapeHtml(bench.average_source || "-")}。
+      </p>
+    </div>
+  `;
 }
 
 function renderConfig(config) {
@@ -519,12 +648,22 @@ function renderConfig(config) {
   form.custom_scenario_shift_pct.value = config.custom_scenario_shift_pct ?? 0.01;
 }
 
+const RISK_CATEGORY_NAMES = {
+  balance_sheet: "资产负债表套保",
+  cash_flow: "现金流套保",
+  order_contract: "合同/订单套保",
+};
+
 function riskCategoryName(value) {
-  return {
-    balance_sheet: "资产负债表套保",
-    cash_flow: "现金流套保",
-    order_contract: "合同/订单套保",
-  }[value] || value || "-";
+  return RISK_CATEGORY_NAMES[value] || value || "-";
+}
+
+// 表外类目是历史数据留下的，会计科目只能兜底到公允价值变动，
+// 这里显式标出来而不是装作认识它。
+function riskCategoryCell(value, known) {
+  const known_ = known === undefined ? value in RISK_CATEGORY_NAMES : known;
+  if (known_) return escapeHtml(riskCategoryName(value));
+  return `${escapeHtml(value || "-")} <span class="warn-tag" title="不是合法的风险类型，会计科目按公允价值变动兜底；建议删除后重新录入">未知类目</span>`;
 }
 
 function bucketName(value) {
