@@ -35,11 +35,14 @@ async function api(path, options = {}) {
 
 function formData(form) {
   const data = Object.fromEntries(new FormData(form).entries());
+  // 未勾选的 checkbox 根本不会出现在 FormData 里，要显式补 false
+  if (form.elements.booked) data.booked = form.elements.booked.checked;
   const numericKeys = [
     "amount",
     "probability",
     "locked_rate",
     "actual_rate",
+    "actual_amount",
     "rate_cache_hours",
     "risk_limit_cny",
     "default_hedge_ratio",
@@ -83,6 +86,8 @@ function renderDashboard(data) {
   renderHedgeTable(data.hedges || []);
   renderScenarioRows(data.scenario_rows || [], data.scenario_totals || {}, data.scenario_uniform);
   renderList("backtestRows", data.backtest || [], renderBacktest);
+  renderPlanDrift(data.plan_drift || {});
+  renderPlans(data.plans || []);
   renderAudit(data.audit || []);
   renderConfig(data.config || {});
 }
@@ -139,7 +144,8 @@ function renderPortfolio(portfolio) {
   box.innerHTML = [
     kpiCard("业务敞口合计", money(portfolio.gross_exposure_cny) + " CNY", "各币种取绝对值后相加"),
     kpiCard("已锁合计", money(portfolio.locked_cny) + " CNY", `已锁比例 ${ratioText(portfolio.locked_ratio)}`),
-    kpiCard("剩余敞口", money(portfolio.net_exposure_cny) + " CNY", "扣掉已锁之后仍暴露的部分", "warn"),
+    kpiCard("剩余敞口", money(portfolio.net_exposure_cny) + " CNY",
+      `币种间天然对冲 ${money(portfolio.natural_offset_cny)} 后净额 ${money(portfolio.net_after_offset_cny)}`, "warn"),
     kpiCard("待锁建议", money(portfolio.recommended_cny) + " CNY", `${portfolio.pending_count} 条建议待处理`, "todo"),
   ].join("");
 
@@ -155,9 +161,11 @@ function renderPortfolio(portfolio) {
   `).join("");
 
   const missing = portfolio.rate_missing || [];
+  const offsetNote = ` 净额口径（假设各币种同向变动、允许天然对冲）为 ${money(portfolio.net_after_offset_cny)} CNY，` +
+    "两个数答的是不同问题：绝对值口径问「风险量级多大」，净额口径问「真正还敞着多少」。";
   note.textContent = missing.length
-    ? `各币种取绝对值后相加，不同币种不互相抵消。${missing.join("、")} 暂无汇率，未计入合计。`
-    : "各币种取绝对值后相加，不同币种不互相抵消——净收美元和净付欧元是两个独立的风险。";
+    ? `各币种取绝对值后相加，不同币种不互相抵消。${missing.join("、")} 暂无汇率，未计入合计。` + offsetNote
+    : "各币种取绝对值后相加，不同币种不互相抵消——净收美元和净付欧元是两个独立的风险。" + offsetNote;
 
   if (badge) badge.textContent = portfolio.pending_count ? String(portfolio.pending_count) : "";
 }
@@ -498,6 +506,50 @@ function renderDetailTable(tbodyId, countId, rows, columns, collection, emptyTex
   });
 }
 
+// ---- category:begin ---- 与 web_app.suggest_category 逐行对应，改动必须两侧同步
+function suggestCategory(row) {
+  if (row.booked) {
+    return ["balance_sheet", "已入账/已开票的外币资产负债，属于资产负债表套保"];
+  }
+  var probability = row.probability;
+  probability = (probability === null || probability === undefined) ? 1 : Number(probability);
+  if (!isFinite(probability)) probability = 1;
+  if (probability >= 1) {
+    return ["order_contract", "金额已确定但尚未入账，属于合同/订单套保"];
+  }
+  return ["cash_flow", "发生概率 " + Math.round(probability * 100) + "%，属于高度可能的预期交易，走现金流套保"];
+}
+// ---- category:end ----
+
+// 专利那份材料里最值得抄的一条：让财务自己在下拉框里选，他多半选不对。
+// 这里只给推荐和理由，不自动改选择——分歧要看得见，不是悄悄替人做主。
+let categoryTouched = false;
+
+function updateCategoryHint() {
+  const form = document.getElementById("exposureForm");
+  const hint = document.getElementById("categoryHint");
+  if (!form || !hint) return;
+  const row = {
+    booked: form.booked.checked,
+    probability: form.probability.value === "" ? 1 : Number(form.probability.value),
+  };
+  const [suggested, reason] = suggestCategory(row);
+  // 用户没动过下拉框就跟着推荐走；一旦手动改过就再也不替他改，
+  // 只把分歧显示出来。默认值和推荐打架是没必要的噪音。
+  if (!categoryTouched && form.category.value !== suggested) {
+    form.category.value = suggested;
+  }
+  const chosen = form.category.value;
+  if (chosen === suggested) {
+    hint.innerHTML = `推荐：<b>${escapeHtml(riskCategoryName(suggested))}</b>——${escapeHtml(reason)}`;
+    hint.className = "notice";
+  } else {
+    hint.innerHTML = `按录入的信息，推荐是<b>${escapeHtml(riskCategoryName(suggested))}</b>（${escapeHtml(reason)}），` +
+      `你选的是<b>${escapeHtml(riskCategoryName(chosen))}</b>。会计科目会按你选的走。`;
+    hint.className = "notice notice-warn";
+  }
+}
+
 function renderExposureTable(rows) {
   renderDetailTable("exposureRows", "exposureCount", rows, [
     { render: (row) => escapeHtml(row.due_date) },
@@ -613,6 +665,27 @@ function renderAudit(rows) {
 
 // 司库口径：结汇均价 vs 当月月均汇率。企业财务按月均记账和考核，
 // 所以这才是甲方真正会问的比法；上面那个锁汇贡献比的是到期即期价。
+// 敞口本身也会不准。订单黄了一半的损失跟汇率没关系，
+// 混在价差里看就会把"订单缩水"记到套保决策头上。
+function renderVariance(v) {
+  if (!v) {
+    return '<p class="meta">未录入实际发生额，只能算价差，量差无从拆分。</p>';
+  }
+  const gap = Number(v.volume_gap);
+  const word = gap === 0 ? "与计划一致" : gap > 0 ? "多于计划" : "少于计划";
+  const over = v.over_hedged
+    ? `<span class="warn-tag" title="敞口没发生但远期已经锁了，远期照样要交割">超额套保 ${money(v.over_hedged_notional)}</span>`
+    : "";
+  return `
+    <p class="meta">
+      价量分解：实际发生 ${money(v.actual_notional)}（计划 ${money(v.planned_notional)}，${word}
+      ${ratioText(Math.abs(v.volume_gap_pct))}）——
+      <b>量差 ${money(v.volume_variance_cny)}</b>（敞口没按计划发生，跟汇率无关）、
+      <b>价差 ${money(v.price_variance_cny)}</b>（结汇均价相对月均），合计 ${money(v.total_variance_cny)} CNY。 ${over}
+    </p>
+  `;
+}
+
 function renderBenchmark(bench) {
   if (!bench) {
     return '<p class="meta">无月均基准：这个币种没有本地行情序列，也没在配置里录入财务月均汇率。</p>';
@@ -632,8 +705,109 @@ function renderBenchmark(bench) {
         择时效应 ${money(bench.timing_effect_cny)}（市场自己从月均走到到期即期，跟锁不锁无关）。
         套保覆盖 ${ratioText(bench.hedge_coverage)}，基准来源：${escapeHtml(bench.average_source || "-")}。
       </p>
+      ${renderVariance(bench.variance)}
     </div>
   `;
+}
+
+const DECISION_LABELS = {
+  enterprise_type: "企业类型",
+  default_hedge_ratio: "默认套保比例",
+  month_currency_hedge_ratios: "分月份/币种套保比例",
+  interest_rates: "利率（影响远期价）",
+  forward_overrides: "远期报价",
+  strategy_type: "策略类型",
+  optimistic_shift_pct: "乐观涨跌幅",
+  pessimistic_shift_pct: "悲观涨跌幅",
+  custom_scenario_shift_pct: "自定义涨跌幅",
+  scenario_shifts: "分币种情景",
+};
+
+// 快照真正的用处不是存档，是回头告诉你"参数已经漂了"。
+// 只有影响建议金额的参数变了才算过期；改情景涨跌幅只影响损益模拟。
+function renderPlanDrift(drift) {
+  const box = document.getElementById("planDrift");
+  if (!box) return;
+  if (!drift.has_plan) {
+    box.innerHTML = "";
+    return;
+  }
+  const parts = [];
+  const decision = Object.entries(drift.decision_changed || {});
+  const scenario = Object.entries(drift.scenario_changed || {});
+  const rates = Object.entries(drift.rate_moved || {});
+
+  if (decision.length) {
+    parts.push(`<p><b>影响建议金额的参数已改：</b>${decision.map(([key, change]) =>
+      `${escapeHtml(DECISION_LABELS[key] || key)} ${escapeHtml(auditValue(change.from))} → ${escapeHtml(auditValue(change.to))}`
+    ).join("；")}</p>`);
+  }
+  if (scenario.length) {
+    parts.push(`<p class="meta">只影响损益模拟、不影响建议金额的改动：${scenario.map(([key]) =>
+      escapeHtml(DECISION_LABELS[key] || key)).join("、")}</p>`);
+  }
+  if (rates.length) {
+    parts.push(`<p class="meta">汇率相对快照的变动：${rates.map(([currency, move]) =>
+      `${escapeHtml(currency)} ${(move.move * 100).toFixed(2)}%`).join("、")}</p>`);
+  }
+  if (!parts.length) {
+    box.innerHTML = `<div class="item">最近方案「${escapeHtml(drift.label || "-")}」的参数与当前一致。</div>`;
+    return;
+  }
+  box.innerHTML = `
+    <div class="item ${drift.stale ? "warn-item" : ""}">
+      <strong>${drift.stale ? "当前建议已经不是方案里的那份" : "方案与当前建议一致"}</strong>
+      <p class="meta">对比对象：「${escapeHtml(drift.label || "-")}」，冻结于 ${escapeHtml(fmtTime(drift.created_at))}</p>
+      ${parts.join("")}
+    </div>
+  `;
+}
+
+function renderPlans(rows) {
+  const box = document.getElementById("planRows");
+  const scope = document.getElementById("plansScope");
+  if (!box) return;
+  if (scope) scope.textContent = rows.length ? `最近 ${rows.length} 份` : "";
+  if (!rows.length) {
+    box.innerHTML = '<div class="item">还没有冻结过方案。在「待锁汇」里点「冻结为方案」。</div>';
+    return;
+  }
+  box.innerHTML = "";
+  rows.forEach((plan) => {
+    const div = document.createElement("div");
+    div.className = "item";
+    const lines = (plan.rows || []).map((row) => `
+      <tr>
+        <td>${escapeHtml(row.period)} ${escapeHtml(row.currency)}</td>
+        <td class="num">${ratioText(row.target_hedge_ratio)}</td>
+        <td class="num">${Number(row.forecast_multiplier).toFixed(2)}×</td>
+        <td class="num">${money(row.recommended_amount)}</td>
+        <td class="num">${row.trade_rate}</td>
+      </tr>
+    `).join("");
+    div.innerHTML = `
+      <strong>${escapeHtml(plan.label)}</strong>
+      <p class="meta">冻结于 ${escapeHtml(fmtTime(plan.created_at))}，
+        默认套保比例 ${ratioText((plan.config || {}).default_hedge_ratio)}，
+        汇率取自 ${escapeHtml((plan.rate_snapshot || {}).status || "-")}</p>
+      <div class="table-wrap">
+        <table>
+          <thead><tr><th>期间/币种</th><th>目标比例</th><th>折扣</th><th>建议金额</th><th>交易汇率</th></tr></thead>
+          <tbody>${lines}</tbody>
+        </table>
+      </div>
+      <button type="button" class="secondary">删除这份方案</button>
+    `;
+    div.querySelector("button").addEventListener("click", async () => {
+      if (!window.confirm(`确认删除方案「${plan.label}」？此操作无法撤销。`)) return;
+      await runAction("正在删除...", async () => {
+        await api(`/api/plans/${plan.id}`, { method: "DELETE" });
+        await loadDashboard();
+        showStatus("方案已删除。");
+      });
+    });
+    box.appendChild(div);
+  });
 }
 
 function renderConfig(config) {
@@ -688,8 +862,28 @@ function ratioText(value) {
 }
 
 function bindForms() {
+  const exposureForm = document.getElementById("exposureForm");
+  ["probability", "booked", "category"].forEach((name) => {
+    const field = exposureForm.elements[name];
+    if (field) field.addEventListener("change", updateCategoryHint);
+  });
+  exposureForm.elements.category.addEventListener("change", () => { categoryTouched = true; });
+  exposureForm.elements.probability.addEventListener("input", updateCategoryHint);
+  updateCategoryHint();
+
+  document.getElementById("freezePlanBtn").addEventListener("click", async () => {
+    const label = document.getElementById("planLabel").value.trim();
+    await runAction("正在冻结方案...", async () => {
+      await api("/api/plans", { method: "POST", body: JSON.stringify({ label }) });
+      document.getElementById("planLabel").value = "";
+      await loadDashboard();
+      showStatus("方案已冻结。之后改配置不会再动它。");
+    });
+  });
+
   document.getElementById("exposureForm").addEventListener("submit", async (event) => {
     event.preventDefault();
+    categoryTouched = false;
     await submitForm(event.currentTarget, "/api/exposures", "敞口已保存", () => {
       document.getElementById("exposureListPanel").scrollIntoView({ behavior: "smooth", block: "start" });
     });

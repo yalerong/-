@@ -16,6 +16,8 @@ from urllib.request import Request, urlopen
 from money import D, f2, f as fN
 import benchmarks
 import forwards
+import plans
+import variance
 
 
 ROOT = Path(__file__).resolve().parent
@@ -388,6 +390,28 @@ def exposure_category_for(exposures: list[dict], period: str, currency: str) -> 
     return max(score.items(), key=lambda item: item[1])[0]
 
 
+def suggest_category(row: dict) -> tuple[str, str]:
+    """从已有字段推荐风险类型，并给出理由。
+
+    专利那份材料里最值得抄的一条洞察：**让财务自己在下拉框里选，
+    他多半选不对**——"由于大部分企业没有准确地识别外汇风险敞口，
+    导致企业可能选择了不适合自己的衍生金融产品"。
+
+    这里不猜、也不自动改，只按会计口径给一个推荐 + 理由，用户可以覆盖；
+    覆盖了就在页面上标出来，让分歧看得见。
+    """
+    if row.get("booked"):
+        return "balance_sheet", "已入账/已开票的外币资产负债，属于资产负债表套保"
+    probability = row.get("probability")
+    try:
+        probability = 1.0 if probability is None else float(probability)
+    except (TypeError, ValueError):
+        probability = 1.0
+    if probability >= 1:
+        return "order_contract", "金额已确定但尚未入账，属于合同/订单套保"
+    return "cash_flow", f"发生概率 {probability:.0%}，属于高度可能的预期交易，走现金流套保"
+
+
 def known_category(category: str | None) -> bool:
     return category in EXPOSURE_CATEGORIES
 
@@ -606,6 +630,9 @@ def build_dashboard(
     backtest_rows = build_backtest(exposures, hedges, settlements, pair_rates, state)
     scenario_totals = aggregate_scenarios(scenario_rows, scenario_rates)
     portfolio = build_portfolio(net_rows, suggestions)
+    plan_list = state.get("plans", [])
+    latest_plan = plan_list[-1] if plan_list else None
+    plan_drift = plans.drift(latest_plan, config, pair_rates)
     return {
         "config": config,
         "rates": rates_cache,
@@ -622,6 +649,8 @@ def build_dashboard(
         "scenario_summary": scenario_summary,
         "backtest": backtest_rows,
         "audit": read_audit(30),
+        "plans": plan_list[-10:][::-1],
+        "plan_drift": plan_drift,
         "forecast": forecast_doc,
         "plain_language": build_plain_language(
             net_rows, suggestions, backtest_rows, rates_cache, scenario_totals
@@ -698,10 +727,22 @@ def build_portfolio(net_rows: list[dict], suggestions: list[dict]) -> dict:
 
     gross_total = sum(row["gross_cny"] for row in rows)
     locked_total = sum(row["locked_cny"] for row in rows)
+    # 两个口径都要给：
+    # 绝对值口径答"风险量级有多大"（不同币种不互相抵消）；
+    # 净额口径答"在所有币种同向变动这个假设下，真正还敞着的净额是多少"。
+    # 后者正是专利背景技术点名的"不同币种间的天然对冲"，但它成立的前提
+    # 恰恰是那个相关性为 1 的假设，所以只能并列、不能取代。
+    signed_net = sum(
+        float(row["net_exposure"]) * float(row["current_rate"])
+        for row in net_rows
+        if row.get("rate_available")
+    )
     return {
         "gross_exposure_cny": f2(gross_total),
         "locked_cny": f2(locked_total),
         "net_exposure_cny": f2(sum(row["net_cny"] for row in rows)),
+        "net_after_offset_cny": f2(signed_net),
+        "natural_offset_cny": f2(sum(row["net_cny"] for row in rows) - abs(signed_net)),
         "recommended_cny": f2(sum(row["recommended_cny"] for row in rows)),
         "locked_ratio": fN(locked_total / gross_total, 4) if gross_total else 0.0,
         "currency_count": len(rows),
@@ -756,6 +797,11 @@ def build_backtest(
         (period_from_date(row.get("due_date", "")), row.get("currency", "").upper()): float(row.get("actual_rate", 0))
         for row in settlements
     }
+    actual_amount_by_key = {
+        (period_from_date(row.get("due_date", "")), row.get("currency", "").upper()): float(row["actual_amount"])
+        for row in settlements
+        if row.get("actual_amount") is not None
+    }
     exposure_totals = aggregate_rows(exposures, signed_exposure)
     hedge_totals = aggregate_rows(hedges, signed_hedge)
     locked_by_key: dict[tuple[str, str], list[dict]] = defaultdict(list)
@@ -793,9 +839,32 @@ def build_backtest(
         benchmark = benchmarks.benchmark_row(
             period, currency, gross, locked_by_key.get(key, []), actual_rate, average_rate, average_source
         )
+        variance_row = None
+        if benchmark:
+            variance_row = variance.decompose(
+                planned_notional=benchmark["notional"],
+                actual_notional=actual_amount_by_key.get(key),
+                realized_avg_rate=benchmark["realized_avg_rate"],
+                benchmark_rate=benchmark["average_rate"],
+                hedged_notional=benchmark["hedged_notional"],
+                gross_signed=gross,
+            )
+            if variance_row:
+                variance_row = {
+                    **variance_row,
+                    "planned_notional": f2(variance_row["planned_notional"]),
+                    "actual_notional": f2(variance_row["actual_notional"]),
+                    "volume_gap": f2(variance_row["volume_gap"]),
+                    "volume_gap_pct": fN(variance_row["volume_gap_pct"], 4),
+                    "volume_variance_cny": f2(variance_row["volume_variance_cny"]),
+                    "price_variance_cny": f2(variance_row["price_variance_cny"]),
+                    "total_variance_cny": f2(variance_row["total_variance_cny"]),
+                    "over_hedged_notional": f2(variance_row["over_hedged_notional"]),
+                }
         if benchmark:
             benchmark = {
                 **benchmark,
+                "variance": variance_row,
                 # 未结算时 actual_rate 是拿当前市场价试算的，
                 # 由它推出来的结汇均价和归因同样是试算值，不能当结算结果读
                 "settled": settled,
@@ -965,6 +1034,17 @@ class FxRiskHandler(BaseHTTPRequestHandler):
                         append_audit("update", "config", None, before, changed)
                     self.send_json({"ok": True, "config": merged})
                     return
+                if self.path == "/api/plans":
+                    dashboard = build_dashboard(state, load_rates(merged_config(state)))
+                    if not dashboard["suggestions"]:
+                        raise ValueError("没有待锁汇建议，无法冻结方案")
+                    plan = add_id(plans.freeze(dashboard, body.get("label"), now_iso()))
+                    state.setdefault("plans", []).append(plan)
+                    save_state(state)
+                    append_audit("freeze", "plans", plan.get("id"), None,
+                                 {"label": plan["label"], "rows": len(plan["rows"])})
+                    self.send_json({"ok": True, "plan": plan})
+                    return
                 if self.path == "/api/reset-demo":
                     append_audit("reset", "workspace", None, state, DEMO_STATE)
                     save_state(DEMO_STATE)
@@ -978,7 +1058,12 @@ class FxRiskHandler(BaseHTTPRequestHandler):
     def do_DELETE(self) -> None:
         parts = self.path.strip("/").split("/")
         if len(parts) == 3 and parts[0] == "api":
-            collection = {"exposures": "exposures", "hedges": "hedges", "settlements": "settlements"}.get(parts[1])
+            collection = {
+                "exposures": "exposures",
+                "hedges": "hedges",
+                "settlements": "settlements",
+                "plans": "plans",
+            }.get(parts[1])
             if collection:
                 record_id = parts[2]
                 with STATE_LOCK:
@@ -1070,6 +1155,19 @@ def validate_settlement(row: dict) -> None:
         raise ValueError(f"missing settlement fields: {', '.join(missing)}")
     if float(row["actual_rate"]) <= 0:
         raise ValueError("actual_rate must be positive")
+    # 实际发生额是可选的，但一旦填了就必须是非负数。
+    # 填 0 是有意义的（订单黄了），所以这里**不能**用 `or` 兜底。
+    raw_amount = row.get("actual_amount")
+    if raw_amount is None or raw_amount == "":
+        row.pop("actual_amount", None)
+        return
+    try:
+        actual_amount = float(raw_amount)
+    except (TypeError, ValueError):
+        raise ValueError("actual_amount must be a number") from None
+    if actual_amount < 0:
+        raise ValueError("actual_amount must not be negative")
+    row["actual_amount"] = actual_amount
 
 
 class FxRiskServer(ThreadingHTTPServer):

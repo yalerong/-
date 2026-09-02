@@ -1,0 +1,190 @@
+"""方案快照、价量分解、类目推导、净额口径的测试。"""
+from __future__ import annotations
+
+import copy
+import unittest
+from datetime import date
+
+import plans
+import variance
+import web_app
+
+
+RATES = {
+    "source": "test",
+    "status": "test",
+    "fetched_at": "2026-05-12T00:00:00Z",
+    "pair_rates": {"USD": 7.2, "EUR": 7.8},
+}
+
+
+def dashboard(state, **kw):
+    return web_app.build_dashboard(state, RATES, forecast_doc={}, **kw)
+
+
+class PlanSnapshotTest(unittest.TestCase):
+    def setUp(self):
+        self.state = copy.deepcopy(web_app.DEMO_STATE)
+
+    def test_freeze_keeps_the_numbers_that_explain_the_advice(self):
+        plan = plans.freeze(dashboard(self.state), "首版", "2026-05-12T00:00:00Z")
+        self.assertEqual(plan["label"], "首版")
+        self.assertEqual(len(plan["rows"]), 2)
+        row = next(r for r in plan["rows"] if r["currency"] == "USD")
+        for key in ("target_hedge_ratio", "forecast_multiplier", "effective_hedge_ratio",
+                    "recommended_amount", "trade_rate", "forward_basis"):
+            self.assertIn(key, row)
+        # 冻的是决策参数，不是整个 config
+        self.assertIn("default_hedge_ratio", plan["config"])
+        self.assertNotIn("rate_api_url", plan["config"])
+        self.assertEqual(plan["rate_snapshot"]["pair_rates"]["USD"], 7.2)
+
+    def test_changing_a_decision_parameter_marks_the_plan_stale(self):
+        plan = plans.freeze(dashboard(self.state), None, "2026-05-12T00:00:00Z")
+        config = dict(web_app.DEFAULT_CONFIG, default_hedge_ratio=0.5)
+
+        result = plans.drift(plan, config, RATES["pair_rates"])
+        self.assertTrue(result["stale"])
+        self.assertEqual(result["decision_changed"]["default_hedge_ratio"],
+                         {"from": 0.8, "to": 0.5})
+        self.assertEqual(result["scenario_changed"], {})
+
+    def test_scenario_only_change_does_not_make_the_advice_stale(self):
+        # 改情景涨跌幅不影响建议金额，只影响损益模拟，不该报"方案过期"
+        plan = plans.freeze(dashboard(self.state), None, "2026-05-12T00:00:00Z")
+        config = dict(web_app.DEFAULT_CONFIG, optimistic_shift_pct=0.05)
+
+        result = plans.drift(plan, config, RATES["pair_rates"])
+        self.assertFalse(result["stale"])
+        self.assertIn("optimistic_shift_pct", result["scenario_changed"])
+
+    def test_rate_moves_are_reported_but_do_not_make_it_stale(self):
+        plan = plans.freeze(dashboard(self.state), None, "2026-05-12T00:00:00Z")
+        result = plans.drift(plan, dict(web_app.DEFAULT_CONFIG), {"USD": 7.5, "EUR": 7.8})
+        self.assertFalse(result["stale"])
+        self.assertIn("USD", result["rate_moved"])
+        self.assertNotIn("EUR", result["rate_moved"])
+        self.assertAlmostEqual(result["rate_moved"]["USD"]["move"], 0.041667, places=5)
+
+    def test_tiny_rate_move_is_noise(self):
+        plan = plans.freeze(dashboard(self.state), None, "2026-05-12T00:00:00Z")
+        result = plans.drift(plan, dict(web_app.DEFAULT_CONFIG), {"USD": 7.2036, "EUR": 7.8})
+        self.assertEqual(result["rate_moved"], {})
+
+    def test_no_plan_yet(self):
+        self.assertEqual(plans.drift(None, {}, {}), {"has_plan": False})
+
+    def test_dashboard_exposes_latest_plan_drift(self):
+        self.state["plans"] = [plans.freeze(dashboard(self.state), None, "2026-05-12T00:00:00Z")]
+        self.state["config"] = dict(web_app.DEFAULT_CONFIG, default_hedge_ratio=0.4)
+        data = dashboard(self.state)
+        self.assertTrue(data["plan_drift"]["stale"])
+        self.assertEqual(len(data["plans"]), 1)
+
+
+class VarianceTest(unittest.TestCase):
+    def test_price_and_volume_add_up_to_the_total(self):
+        row = variance.decompose(
+            planned_notional=1000, actual_notional=800,
+            realized_avg_rate=7.15, benchmark_rate=7.10,
+            hedged_notional=500, gross_signed=1000,
+        )
+        # 量差 = (800-1000) × 7.10 = -1420
+        self.assertAlmostEqual(row["volume_variance_cny"], -1420.0, places=6)
+        # 价差 = 800 × (7.15-7.10) = 40
+        self.assertAlmostEqual(row["price_variance_cny"], 40.0, places=6)
+        self.assertAlmostEqual(row["total_variance_cny"], -1380.0, places=6)
+        self.assertAlmostEqual(
+            row["total_variance_cny"],
+            row["volume_variance_cny"] + row["price_variance_cny"], places=9,
+        )
+
+    def test_shrinking_exposure_below_the_hedge_is_over_hedging(self):
+        # 计划 1000 锁了 800，实际只发生 500：有 300 是裸多头，远期照样得交割
+        row = variance.decompose(
+            planned_notional=1000, actual_notional=500,
+            realized_avg_rate=7.15, benchmark_rate=7.10,
+            hedged_notional=800, gross_signed=1000,
+        )
+        self.assertTrue(row["over_hedged"])
+        self.assertAlmostEqual(row["over_hedged_notional"], 300.0, places=6)
+        self.assertAlmostEqual(row["volume_gap_pct"], -0.5, places=6)
+
+    def test_payment_side_flips_the_sign(self):
+        row = variance.decompose(
+            planned_notional=1000, actual_notional=800,
+            realized_avg_rate=7.15, benchmark_rate=7.10,
+            hedged_notional=0, gross_signed=-1000,
+        )
+        # 净付方少付了，量差对你有利
+        self.assertAlmostEqual(row["volume_variance_cny"], 1420.0, places=6)
+        self.assertAlmostEqual(row["price_variance_cny"], -40.0, places=6)
+
+    def test_no_actual_amount_means_no_decomposition(self):
+        self.assertIsNone(variance.decompose(1000, None, 7.15, 7.10, 0, 1000))
+
+    def test_zero_actual_amount_is_a_real_number_not_missing(self):
+        # 订单彻底黄了：实际发生额 0，不能被当成"没填"
+        row = variance.decompose(1000, 0, 7.15, 7.10, 600, 1000)
+        self.assertIsNotNone(row)
+        self.assertAlmostEqual(row["volume_variance_cny"], -7100.0, places=6)
+        self.assertAlmostEqual(row["price_variance_cny"], 0.0, places=6)
+        self.assertAlmostEqual(row["over_hedged_notional"], 600.0, places=6)
+
+    def test_backtest_carries_the_decomposition(self):
+        state = copy.deepcopy(web_app.DEMO_STATE)
+        state["settlements"] = [{
+            "id": "s1", "due_date": "2026-06-30", "currency": "USD",
+            "actual_rate": 7.21, "actual_amount": 900000,
+        }]
+        state["monthly_average_rates"] = {"2026-06:USD": 7.15}
+        row = next(r for r in dashboard(state)["backtest"] if r["currency"] == "USD")
+        var = row["benchmark"]["variance"]
+        self.assertEqual(var["planned_notional"], 1200000)
+        self.assertEqual(var["actual_notional"], 900000)
+        self.assertLess(var["volume_variance_cny"], 0)
+
+
+class CategorySuggestionTest(unittest.TestCase):
+    def test_booked_items_are_balance_sheet(self):
+        category, reason = web_app.suggest_category({"booked": True, "probability": 1})
+        self.assertEqual(category, "balance_sheet")
+        self.assertIn("已入账", reason)
+
+    def test_certain_but_unbooked_is_order_contract(self):
+        category, _ = web_app.suggest_category({"probability": 1})
+        self.assertEqual(category, "order_contract")
+
+    def test_uncertain_is_cash_flow(self):
+        category, reason = web_app.suggest_category({"probability": 0.6})
+        self.assertEqual(category, "cash_flow")
+        self.assertIn("60%", reason)
+
+    def test_suggestion_is_always_a_legal_category(self):
+        for row in ({}, {"probability": None}, {"probability": "bad"}, {"booked": False}):
+            category, _ = web_app.suggest_category(row)
+            self.assertTrue(web_app.known_category(category), row)
+
+
+class NetOffsetTest(unittest.TestCase):
+    def test_gross_and_net_are_both_reported(self):
+        portfolio = dashboard(web_app.DEMO_STATE)["portfolio"]
+        # 净收 USD 70 万 × 7.2 = 504 万；净付 EUR 35 万 × 7.8 = 273 万
+        self.assertAlmostEqual(portfolio["net_exposure_cny"], 5040000 + 2730000, places=2)
+        # 同向变动假设下两者对冲，净额只剩 231 万
+        self.assertAlmostEqual(portfolio["net_after_offset_cny"], 5040000 - 2730000, places=2)
+        self.assertGreater(portfolio["natural_offset_cny"], 0)
+
+    def test_same_direction_currencies_do_not_offset(self):
+        state = copy.deepcopy(web_app.DEMO_STATE)
+        # 两个币种都是净收，没有天然对冲可言
+        state["exposures"][1]["direction"] = "receipt"
+        portfolio = dashboard(state)["portfolio"]
+        self.assertAlmostEqual(
+            portfolio["net_after_offset_cny"], portfolio["net_exposure_cny"], places=2
+        )
+        self.assertAlmostEqual(portfolio["natural_offset_cny"], 0, places=2)
+
+
+if __name__ == "__main__":
+    unittest.main()
