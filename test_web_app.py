@@ -131,6 +131,52 @@ class WebAppLogicTest(unittest.TestCase):
             places=2,
         )
 
+    def test_portfolio_totals_do_not_net_across_currencies(self):
+        dashboard = web_app.build_dashboard(web_app.DEMO_STATE, self.rates, forecast_doc={})
+        portfolio = dashboard["portfolio"]
+
+        # USD 净收 + EUR 净付：取绝对值相加，不能互相抵消
+        usd_gross = 1200000 * self.rates["pair_rates"]["USD"]
+        eur_gross = 350000 * self.rates["pair_rates"]["EUR"]
+        self.assertAlmostEqual(portfolio["gross_exposure_cny"], usd_gross + eur_gross, places=2)
+        self.assertGreater(portfolio["gross_exposure_cny"], usd_gross)
+
+        self.assertAlmostEqual(
+            portfolio["locked_cny"], 500000 * self.rates["pair_rates"]["USD"], places=2
+        )
+        self.assertAlmostEqual(
+            portfolio["locked_ratio"], portfolio["locked_cny"] / portfolio["gross_exposure_cny"], places=4
+        )
+        self.assertEqual(portfolio["currency_count"], 2)
+        self.assertEqual(portfolio["pending_count"], len(dashboard["suggestions"]))
+        self.assertEqual(portfolio["rate_missing"], [])
+
+        by_currency = {row["currency"]: row for row in portfolio["by_currency"]}
+        self.assertAlmostEqual(
+            by_currency["USD"]["recommended_cny"], 460000 * self.rates["pair_rates"]["USD"], places=2
+        )
+        self.assertEqual(by_currency["EUR"]["locked_cny"], 0)
+
+    def test_portfolio_skips_currencies_without_a_rate(self):
+        state = copy.deepcopy(web_app.DEMO_STATE)
+        state["exposures"].append(
+            {
+                "id": "demo-exp-3",
+                "due_date": "2026-07-31",
+                "currency": "ZZZ",
+                "amount": 999,
+                "direction": "receipt",
+                "category": "cash_flow",
+                "probability": 1,
+            }
+        )
+        dashboard = web_app.build_dashboard(state, self.rates, forecast_doc={})
+        portfolio = dashboard["portfolio"]
+
+        self.assertIn("ZZZ", portfolio["rate_missing"])
+        zzz = next(row for row in portfolio["by_currency"] if row["currency"] == "ZZZ")
+        self.assertEqual(zzz["gross_cny"], 0)
+
     def test_pair_rates_from_open_endpoint_payload(self):
         payload = {"rates": {"USD": 1, "CNY": 7.2, "EUR": 0.9}}
         rates = web_app.pair_rates_from_payload(payload, ["USD", "EUR"])

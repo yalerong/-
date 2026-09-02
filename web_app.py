@@ -483,6 +483,7 @@ def build_dashboard(state: dict, rates_cache: dict, forecast_doc: dict | None = 
 
     backtest_rows = build_backtest(exposures, hedges, settlements, pair_rates)
     scenario_totals = aggregate_scenarios(scenario_rows, scenario_rates)
+    portfolio = build_portfolio(net_rows, suggestions)
     return {
         "config": config,
         "rates": rates_cache,
@@ -490,6 +491,7 @@ def build_dashboard(state: dict, rates_cache: dict, forecast_doc: dict | None = 
         "hedges": hedges,
         "settlements": settlements,
         "net_exposures": net_rows,
+        "portfolio": portfolio,
         "suggestions": suggestions,
         "scenario_rates": scenario_rates,
         "scenario_rows": scenario_rows,
@@ -511,6 +513,72 @@ def suggestion_text(currency: str, net: float, ratio: float, amount: float, acti
         exposure_side = f"未来净付 {currency}"
         action_text = "买入外币/远期购汇"
     return f"{exposure_side}，建议先锁 {ratio:.0%}，即 {amount:,.2f} {currency}，操作方向：{action_text}。"
+
+
+def build_portfolio(net_rows: list[dict], suggestions: list[dict]) -> dict:
+    """驾驶舱口径：把各行折成人民币后汇总。
+
+    **各币种取绝对值后相加，不同币种之间不互相抵消**——USD 净收和 EUR 净付
+    是两个独立的风险，凑在一起算净额会把风险做小。同一币种同一期间的收付
+    已经在 net_exposures 里抵过了。
+    """
+    recommended_by_key: dict[tuple[str, str], float] = defaultdict(float)
+    for item in suggestions:
+        key = (item["period"], item["currency"])
+        recommended_by_key[key] += abs(float(item.get("recommended_amount", 0.0)))
+
+    by_currency: dict[str, dict] = {}
+    missing_rate: list[str] = []
+    for row in net_rows:
+        currency = row["currency"]
+        bucket = by_currency.setdefault(
+            currency,
+            {
+                "currency": currency,
+                "gross_cny": 0.0,
+                "locked_cny": 0.0,
+                "net_cny": 0.0,
+                "recommended_cny": 0.0,
+                "periods": 0,
+            },
+        )
+        bucket["periods"] += 1
+        if not row.get("rate_available"):
+            if currency not in missing_rate:
+                missing_rate.append(currency)
+            continue
+        rate = float(row["current_rate"])
+        bucket["gross_cny"] += abs(float(row["business_exposure"])) * rate
+        bucket["locked_cny"] += abs(float(row["locked_exposure"])) * rate
+        bucket["net_cny"] += abs(float(row["net_exposure"])) * rate
+        bucket["recommended_cny"] += recommended_by_key.get((row["period"], currency), 0.0) * rate
+
+    rows = []
+    for bucket in sorted(by_currency.values(), key=lambda item: -item["gross_cny"]):
+        gross = bucket["gross_cny"]
+        rows.append(
+            {
+                **{key: round(value, 2) for key, value in bucket.items() if key != "currency"},
+                "currency": bucket["currency"],
+                "locked_ratio": round(bucket["locked_cny"] / gross, 4) if gross else 0.0,
+            }
+        )
+
+    gross_total = sum(row["gross_cny"] for row in rows)
+    locked_total = sum(row["locked_cny"] for row in rows)
+    return {
+        "gross_exposure_cny": round(gross_total, 2),
+        "locked_cny": round(locked_total, 2),
+        "net_exposure_cny": round(sum(row["net_cny"] for row in rows), 2),
+        "recommended_cny": round(sum(row["recommended_cny"] for row in rows), 2),
+        "locked_ratio": round(locked_total / gross_total, 4) if gross_total else 0.0,
+        "currency_count": len(rows),
+        "period_count": len({row["period"] for row in net_rows}),
+        "leg_count": len(net_rows),
+        "pending_count": len(suggestions),
+        "rate_missing": missing_rate,
+        "by_currency": rows,
+    }
 
 
 def aggregate_scenarios(

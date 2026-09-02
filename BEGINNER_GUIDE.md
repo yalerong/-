@@ -72,7 +72,7 @@
 ## 怎么运行白话解释
 
 ```powershell
-cd C:\Users\z1628\Documents\fx_patent_reconstruction
+cd <你放这个项目的目录>\fx_patent_reconstruction
 python fx_risk_simulator.py sample_data.json --explain
 ```
 

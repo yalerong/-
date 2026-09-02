@@ -61,6 +61,7 @@ async function loadDashboard() {
 
 function renderDashboard(data) {
   renderRateStatus(data);
+  renderPortfolio(data.portfolio || {});
   renderSuggestions(data.suggestions || []);
   renderNetExposure(data.net_exposures || []);
   renderList("exposureRows", data.exposures || [], renderExposure);
@@ -83,6 +84,100 @@ function fmtTime(iso) {
   const d = new Date(iso);
   if (Number.isNaN(d.getTime())) return iso;
   return d.toLocaleString("zh-CN", { hour12: false });
+}
+
+function ratioBar(ratio) {
+  const pct = Math.max(0, Math.min(1, Number(ratio || 0))) * 100;
+  return `<span class="bar"><span class="bar-fill" style="width:${pct.toFixed(1)}%"></span></span>`;
+}
+
+function kpiCard(label, value, note, tone) {
+  return `
+    <div class="kpi${tone ? " kpi-" + tone : ""}">
+      <span class="kpi-label">${label}</span>
+      <strong class="kpi-value">${value}</strong>
+      <span class="kpi-note">${note || ""}</span>
+    </div>
+  `;
+}
+
+function renderPortfolio(portfolio) {
+  const box = document.getElementById("portfolioCards");
+  const scope = document.getElementById("portfolioScope");
+  const tbody = document.getElementById("portfolioByCurrency");
+  const note = document.getElementById("portfolioNote");
+  const badge = document.getElementById("todoCount");
+  if (!box) return;
+
+  const rows = portfolio.by_currency || [];
+  if (!rows.length) {
+    box.innerHTML = '<div class="kpi"><span class="kpi-label">暂无敞口</span><strong class="kpi-value">—</strong><span class="kpi-note">先在「录入」里添加一笔</span></div>';
+    tbody.innerHTML = "";
+    scope.textContent = "";
+    note.textContent = "";
+    if (badge) badge.textContent = "";
+    return;
+  }
+
+  scope.textContent = `${portfolio.currency_count} 个币种 · ${portfolio.period_count} 个期间 · ${portfolio.leg_count} 组敞口`;
+  box.innerHTML = [
+    kpiCard("业务敞口合计", money(portfolio.gross_exposure_cny) + " CNY", "各币种取绝对值后相加"),
+    kpiCard("已锁合计", money(portfolio.locked_cny) + " CNY", `已锁比例 ${ratioText(portfolio.locked_ratio)}`),
+    kpiCard("剩余敞口", money(portfolio.net_exposure_cny) + " CNY", "扣掉已锁之后仍暴露的部分", "warn"),
+    kpiCard("待锁建议", money(portfolio.recommended_cny) + " CNY", `${portfolio.pending_count} 条建议待处理`, "todo"),
+  ].join("");
+
+  tbody.innerHTML = rows.map((row) => `
+    <tr>
+      <td>${row.currency}</td>
+      <td>${money(row.gross_cny)}</td>
+      <td>${money(row.locked_cny)}</td>
+      <td>${money(row.net_cny)}</td>
+      <td>${ratioBar(row.locked_ratio)} ${ratioText(row.locked_ratio)}</td>
+      <td>${money(row.recommended_cny)}</td>
+    </tr>
+  `).join("");
+
+  const missing = portfolio.rate_missing || [];
+  note.textContent = missing.length
+    ? `各币种取绝对值后相加，不同币种不互相抵消。${missing.join("、")} 暂无汇率，未计入合计。`
+    : "各币种取绝对值后相加，不同币种不互相抵消——净收美元和净付欧元是两个独立的风险。";
+
+  if (badge) badge.textContent = portfolio.pending_count ? String(portfolio.pending_count) : "";
+}
+
+function setupSideNav() {
+  const links = Array.from(document.querySelectorAll(".sidenav a[data-nav]"));
+  if (!links.length) return;
+  const sections = links
+    .map((link) => document.getElementById(link.dataset.nav))
+    .filter(Boolean);
+
+  const activate = (id) => {
+    links.forEach((link) => {
+      link.classList.toggle("active", link.dataset.nav === id);
+    });
+  };
+
+  if ("IntersectionObserver" in window) {
+    const seen = new Map();
+    const observer = new IntersectionObserver(
+      (entries) => {
+        entries.forEach((entry) => seen.set(entry.target.id, entry));
+        const visible = Array.from(seen.values())
+          .filter((entry) => entry.isIntersecting)
+          .sort((a, b) => a.boundingClientRect.top - b.boundingClientRect.top);
+        if (visible.length) activate(visible[0].target.id);
+      },
+      { rootMargin: "-72px 0px -55% 0px", threshold: 0 },
+    );
+    sections.forEach((section) => observer.observe(section));
+  }
+
+  links.forEach((link) => {
+    link.addEventListener("click", () => activate(link.dataset.nav));
+  });
+  activate(links[0].dataset.nav);
 }
 
 function renderRateStatus(data) {
@@ -501,6 +596,7 @@ async function runAction(busyMessage, action, finallyAction = null) {
 }
 
 bindForms();
+setupSideNav();
 setDefaultDates();
 showStatus("正在加载数据...", "busy");
 loadDashboard()
