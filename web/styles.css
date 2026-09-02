@@ -1,15 +1,96 @@
 :root {
-  color-scheme: light;
-  --bg: #f6f7f9;
+  color-scheme: light dark;
+
+  /* 配色跟 Claude 走：暖调米白底 + 陶土色强调，不是常见的冷灰蓝。
+     语义色刻意避开纯红/纯绿配对——红绿色盲下那组分不开，
+     改用蓝(收) / 琥珀(付) 这种明度也拉开的组合。 */
+  --bg: #faf9f5;
   --panel: #ffffff;
-  --text: #17202a;
-  --muted: #5f6b7a;
-  --line: #d9dee7;
-  --accent: #0f766e;
-  --accent-dark: #115e59;
-  --danger: #b42318;
-  --good: #067647;
+  --panel-2: #f5f3ee;
+  --hover: #f0ede4;
+  --text: #1f1e1d;
+  --muted: #6f6d66;
+  --neutral-text: #46443f;
+  --neutral-soft: #ebe8e0;
+  --neutral-strong: #46443f;
+  --line: #e6e2d9;
+  --line-strong: #d5d0c4;
+  --on-accent: #ffffff;
+
+  --accent: #c96442;
+  --accent-dark: #a94f32;
+  --accent-soft: #f8ece7;
+  --accent-line: #edc9b9;
+
+  --topbar-bg: #2b2926;
+  --topbar-text: #faf9f5;
+  --topbar-muted: #b9b5ab;
+
+  --good: #3f7d67;
+  --good-dark: #2f5f4d;
+  --good-soft: #e8f1ec;
+  --good-line: #b9d5c8;
+
+  --warn: #9a6320;
+  --warn-soft: #f8efdd;
+
+  --danger: #b3402f;
+  --danger-soft: #fbeae6;
+  --danger-line: #eec4b9;
+  --danger-on-dark: #f0a99b;
+  --danger-line-on-dark: #c96442;
+
+  --info: #4a6fa5;
+  --info-dark: #37527a;
+  --info-soft: #e9eef6;
+  --info-line: #c2d1e6;
 }
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #1f1e1d;
+    --panel: #262624;
+    --panel-2: #2e2d2a;
+    --hover: #34322e;
+    --text: #f5f4ef;
+    --muted: #a3a099;
+    --neutral-text: #cbc8c1;
+    --neutral-soft: #35332f;
+    --neutral-strong: #cbc8c1;
+    --line: #3a3833;
+    --line-strong: #4a4740;
+    --on-accent: #1f1e1d;
+
+    --accent: #d97757;
+    --accent-dark: #e59578;
+    --accent-soft: #35281f;
+    --accent-line: #56392a;
+
+    --topbar-bg: #171614;
+    --topbar-text: #f5f4ef;
+    --topbar-muted: #97948c;
+
+    --good: #78bda4;
+    --good-dark: #9ed3bf;
+    --good-soft: #1e2f28;
+    --good-line: #35564a;
+
+    --warn: #d2a05c;
+    --warn-soft: #33281a;
+
+    --danger: #e0897a;
+    --danger-soft: #33211d;
+    --danger-line: #5b3229;
+    --danger-on-dark: #f0a99b;
+    --danger-line-on-dark: #c96442;
+
+    --info: #8fadd8;
+    --info-dark: #b3c8e6;
+    --info-soft: #1e2530;
+    --info-line: #37455c;
+  }
+}
+
 
 * {
   box-sizing: border-box;
@@ -30,8 +111,8 @@ body {
   gap: 24px;
   align-items: center;
   padding: 18px 24px;
-  background: #1f2937;
-  color: #ffffff;
+  background: var(--topbar-bg);
+  color: var(--topbar-text);
 }
 
 h1,
@@ -51,7 +132,7 @@ h2 {
 }
 
 .topbar p {
-  color: #d1d5db;
+  color: var(--topbar-muted);
   margin-top: 4px;
 }
 
@@ -74,25 +155,25 @@ main {
 }
 
 .status-bar {
-  border: 1px solid #b7d7d1;
+  border: 1px solid var(--good-line);
   border-radius: 8px;
-  background: #ecfdf5;
-  color: #075e54;
+  background: var(--good-soft);
+  color: var(--good-dark);
   padding: 10px 12px;
   margin-bottom: 16px;
   font-weight: 600;
 }
 
 .status-bar.error {
-  border-color: #f3b4ae;
-  background: #fff3f1;
+  border-color: var(--danger-line);
+  background: var(--danger-soft);
   color: var(--danger);
 }
 
 .status-bar.busy {
-  border-color: #c7d2fe;
-  background: #eef2ff;
-  color: #3730a3;
+  border-color: var(--info-line);
+  background: var(--info-soft);
+  color: var(--info-dark);
 }
 
 .panel-title {
@@ -143,7 +224,7 @@ select {
   border-radius: 6px;
   padding: 7px 9px;
   color: var(--text);
-  background: #ffffff;
+  background: var(--panel);
 }
 
 button {
@@ -152,7 +233,7 @@ button {
   border-radius: 6px;
   padding: 8px 12px;
   background: var(--accent);
-  color: #ffffff;
+  color: var(--on-accent);
   cursor: pointer;
   font-weight: 600;
 }
@@ -162,20 +243,20 @@ button:hover {
 }
 
 button.secondary {
-  background: #4b5563;
+  background: var(--neutral-strong);
 }
 
 /* Destructive actions get a quieter outline so they read as "handle with care"
    instead of looking like an ordinary button. */
 button.danger-outline {
   background: transparent;
-  color: #fca5a5;
-  border: 1px solid #ef4444;
+  color: var(--danger-on-dark);
+  border: 1px solid var(--danger-line-on-dark);
 }
 
 button.danger-outline:hover {
   background: var(--danger);
-  color: #ffffff;
+  color: var(--on-accent);
 }
 
 .actions {
@@ -206,7 +287,7 @@ ol {
   border: 1px solid var(--line);
   border-radius: 8px;
   padding: 12px;
-  background: #fbfcfe;
+  background: var(--panel-2);
 }
 
 .card strong,
@@ -238,18 +319,18 @@ ol {
   margin-right: 4px;
 }
 
-.net-in { background: #dbeafe; color: #1d4ed8; }
-.net-out { background: #fef3c7; color: #92400e; }
-.net-flat { background: #e5e7eb; color: #374151; }
+.net-in { background: var(--info-soft); color: var(--info); }
+.net-out { background: var(--warn-soft); color: var(--warn); }
+.net-flat { background: var(--neutral-soft); color: var(--neutral-text); }
 
 .warn-tag {
   display: inline-block;
   padding: 1px 7px;
   border-radius: 6px;
   font-size: 12px;
-  background: #fff3f1;
+  background: var(--danger-soft);
   color: var(--danger);
-  border: 1px solid #f3b4ae;
+  border: 1px solid var(--danger-line);
 }
 
 .table-wrap {
@@ -282,7 +363,7 @@ th {
 .forecast-block {
   margin: 8px 0 10px;
   padding: 8px 10px;
-  background: #f8fafc;
+  background: var(--panel-2);
   border: 1px solid var(--line);
   border-radius: 6px;
   display: flex;
@@ -302,16 +383,16 @@ th {
   border-radius: 999px;
   font-size: 12px;
   line-height: 1.6;
-  background: #e5e7eb;
-  color: #1f2937;
+  background: var(--neutral-soft);
+  color: var(--topbar-bg);
 }
 
-.chip.dir-up { background: #dbeafe; color: #1d4ed8; }
-.chip.dir-down { background: #fef3c7; color: #92400e; }
-.chip.dir-flat { background: #e5e7eb; color: #374151; }
-.chip.tier-support { background: #dcfce7; color: #166534; }
-.chip.tier-caution { background: #fef3c7; color: #92400e; }
-.chip.tier-reject { background: #e5e7eb; color: #6b7280; }
+.chip.dir-up { background: var(--info-soft); color: var(--info); }
+.chip.dir-down { background: var(--warn-soft); color: var(--warn); }
+.chip.dir-flat { background: var(--neutral-soft); color: var(--neutral-text); }
+.chip.tier-support { background: var(--good-soft); color: var(--good-dark); }
+.chip.tier-caution { background: var(--warn-soft); color: var(--warn); }
+.chip.tier-reject { background: var(--neutral-soft); color: var(--muted); }
 
 .forecast-spark {
   color: var(--accent);
@@ -342,8 +423,8 @@ th {
 }
 
 .total-item {
-  border-left: 3px solid #0f766e;
-  background: #f3faf8;
+  border-left: 3px solid var(--accent);
+  background: var(--accent-soft);
 }
 
 .total-item .total-cell {
@@ -404,11 +485,11 @@ th {
 }
 
 .sidenav a:hover {
-  background: #eef2f6;
+  background: var(--hover);
 }
 
 .sidenav a.active {
-  background: #e7f2f0;
+  background: var(--accent-soft);
   border-left-color: var(--accent);
   color: var(--accent-dark);
   font-weight: 600;
@@ -423,7 +504,7 @@ th {
   padding: 0 5px;
   border-radius: 9px;
   background: var(--accent);
-  color: #fff;
+  color: var(--on-accent);
   font-size: 11px;
   line-height: 18px;
   text-align: center;
@@ -440,7 +521,7 @@ th {
   border: 1px solid var(--line);
   border-radius: 8px;
   padding: 14px 16px;
-  background: #fbfcfd;
+  background: var(--panel-2);
   display: flex;
   flex-direction: column;
   gap: 6px;
@@ -463,13 +544,13 @@ th {
 }
 
 .kpi-warn {
-  background: #fdf6f4;
-  border-color: #f0d5cd;
+  background: var(--danger-soft);
+  border-color: var(--danger-line);
 }
 
 .kpi-todo {
-  background: #f2f9f7;
-  border-color: #cfe6e0;
+  background: var(--accent-soft);
+  border-color: var(--accent-line);
 }
 
 .bar {
@@ -477,7 +558,7 @@ th {
   width: 54px;
   height: 6px;
   border-radius: 3px;
-  background: #e5e9ef;
+  background: var(--neutral-soft);
   vertical-align: middle;
   overflow: hidden;
 }
@@ -559,13 +640,13 @@ th {
   font-size: 12px;
   background: transparent;
   color: var(--danger);
-  border: 1px solid #e3c2bd;
+  border: 1px solid var(--danger-line);
   border-radius: 5px;
   cursor: pointer;
 }
 
 .row-delete:hover {
-  background: #fdf2f0;
+  background: var(--danger-soft);
 }
 
 .bench-block {
@@ -575,6 +656,6 @@ th {
 }
 
 .warn-item {
-  border-left: 3px solid #b4531a;
-  background: #fdf7f2;
+  border-left: 3px solid var(--warn);
+  background: var(--warn-soft);
 }
