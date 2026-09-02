@@ -4,7 +4,7 @@
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>外汇风险与锁汇工作台</title>
-    <link rel="stylesheet" href="/web/styles.css?v=12" />
+    <link rel="stylesheet" href="/web/styles.css?v=16" />
   </head>
   <body>
     <header class="topbar">
@@ -35,6 +35,7 @@
         </div>
         <div class="nav-group">
           <span class="nav-title">其他</span>
+          <a href="#plans" data-nav="plans">方案存档</a>
           <a href="#audit" data-nav="audit">变更记录</a>
           <a href="#rates" data-nav="rates">汇率与缓存</a>
           <a href="#config" data-nav="config">配置</a>
@@ -104,7 +105,13 @@
             <h2>待锁汇</h2>
             <p>建议金额 = 业务敞口 × 目标套保比例 × 预测折扣 − 已锁金额。目标比例来自配置（可按月份与币种单独覆盖），预测折扣只会调低比例，不会调高。</p>
           </div>
+          <div id="planDrift"></div>
           <div id="suggestions" class="cards"></div>
+          <div class="plan-actions">
+            <input id="planLabel" type="text" placeholder="方案名称（可留空）" maxlength="40" />
+            <button id="freezePlanBtn" type="button">冻结为方案</button>
+            <span class="meta">冻结后这份建议连同当时的配置、汇率、预测信号都成为只读快照，之后改配置不会动它。</span>
+          </div>
         </section>
 
         <section id="entry" class="grid two">
@@ -120,6 +127,9 @@
             </label>
             <label>金额 <input name="amount" type="number" min="0" step="0.01" required /></label>
             <label>概率 <input name="probability" type="number" min="0" max="1" step="0.01" value="1" /></label>
+            <label class="checkbox-label">
+              <input name="booked" type="checkbox" /> 已入账 / 已开票
+            </label>
             <label>风险类型
               <select name="category">
                 <option value="balance_sheet">资产负债表套保</option>
@@ -127,6 +137,7 @@
                 <option value="order_contract">合同/订单套保</option>
               </select>
             </label>
+            <p class="notice" id="categoryHint"></p>
             <label>备注 <input name="description" placeholder="例如：6月出口订单" /></label>
             <button type="submit">保存敞口</button>
           </form>
@@ -165,6 +176,7 @@
                     <th>金额</th>
                     <th>概率</th>
                     <th>风险类型</th>
+                    <th>已入账</th>
                     <th>备注</th>
                     <th class="col-action"></th>
                   </tr>
@@ -204,6 +216,7 @@
             <label>到期日 <input name="due_date" type="date" required /></label>
             <label>币种 <input name="currency" value="USD" maxlength="3" required /></label>
             <label>实际汇率 <input name="actual_rate" type="number" min="0" step="0.000001" required /></label>
+            <label>实际发生额 <input name="actual_amount" type="number" min="0" step="0.01" placeholder="选填；订单黄了就填 0" /></label>
             <label>备注 <input name="description" placeholder="例如：到期结算汇率" /></label>
             <button type="submit">保存实际汇率</button>
           </form>
@@ -217,6 +230,18 @@
         </section>
 
         <!-- ==================== 其他 ==================== -->
+        <section id="plans" class="panel">
+          <div class="panel-title">
+            <h2>方案存档</h2>
+            <span class="meta" id="plansScope"></span>
+          </div>
+          <p class="notice">
+            方案是只读快照：冻结那一刻的建议、配置、汇率、预测信号原样保存。
+            配置是可变的，没有快照就回答不了「<b>当初</b>是按什么参数给的这条建议」。
+          </p>
+          <div id="planRows" class="list"></div>
+        </section>
+
         <section id="audit" class="panel">
           <div class="panel-title">
             <h2>变更记录</h2>
@@ -273,6 +298,6 @@
       </main>
     </div>
 
-    <script src="/web/app.js?v=12"></script>
+    <script src="/web/app.js?v=16"></script>
   </body>
 </html>

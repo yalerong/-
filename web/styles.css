@@ -659,3 +659,37 @@ th {
   border-left: 3px solid var(--warn);
   background: var(--warn-soft);
 }
+
+/* ===== 方案存档 / 录入提示 ===== */
+.plan-actions {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 10px;
+  margin-top: 14px;
+  padding-top: 14px;
+  border-top: 1px solid var(--line);
+}
+
+.plan-actions input {
+  flex: 0 1 220px;
+}
+
+.plan-actions .meta {
+  flex: 1 1 260px;
+}
+
+.checkbox-label {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.checkbox-label input {
+  width: auto;
+  margin: 0;
+}
+
+.notice-warn {
+  color: var(--warn);
+}

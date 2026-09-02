@@ -75,7 +75,10 @@ def _monthly_means(filename: str) -> dict[str, float]:
 
 def monthly_average(state: dict, period: str, currency: str) -> tuple[float | None, str | None]:
     """返回 (月均汇率, 来源说明)；取不到就是 (None, None)。"""
-    manual = (state.get("monthly_average_rates") or {})
+    # 两个位置都读：/api/config 会把用户提交的东西存进 state["config"]，
+    # 只读顶层的话，用户按说明填进配置的月均汇率会被静默忽略。
+    manual = dict((state.get("config") or {}).get("monthly_average_rates") or {})
+    manual.update(state.get("monthly_average_rates") or {})
     for key, needs_dict in ((f"{period}:{currency}", False), (period, True)):
         value = manual.get(key)
         # 只写月份不写币种的那种 key，值必须是 {币种: 汇率}。
@@ -125,6 +128,7 @@ def benchmark_row(
     actual_rate: float,
     average_rate: float | None,
     average_source: str | None,
+    actual_notional: float | None = None,
 ) -> dict | None:
     """把一个（期间 × 币种）的实际结果折算成结汇均价，再和月均比。
 
@@ -133,13 +137,34 @@ def benchmark_row(
     差额对收汇方是"多收的人民币"，对付汇方是"少付的人民币"，
     所以按敞口方向定符号，正数一律表示比基准好。
     """
-    notional = abs(gross_signed)
-    if notional <= 0 or not average_rate:
+    # 没有净敞口就没有方向，符号无从谈起（sign 会把平头寸当成付汇方）。
+    if not average_rate or gross_signed == 0:
         return None
+
+    # 结汇均价要按**实际结算的量**算。原来一律按计划敞口算并在计划量上截断，
+    # 实际收到 2000 而计划只有 1000 时，多出来的 1000 就按到期即期价被忽略了。
+    # 注意判空要看 actual_notional 是不是 None，**不能看量是不是 0**：
+    # 订单彻底黄了就是 0，那恰恰是最该看到超额套保警告的时候，
+    # 把整行 return None 掉等于在最危险的时刻把面板清空。
+    notional = abs(gross_signed) if actual_notional is None else abs(actual_notional)
+
+    # 未截断的对冲总量单独一遍算。写在下面那个带 break 的循环里的话，
+    # 溢出那一笔之后的锁汇根本不会被累加，"未截断"就是句空话。
+    offsetting_total = sum(
+        offsetting_amount(hedge, gross_signed)
+        for hedge in hedges
+        if float(hedge.get("locked_rate", 0) or 0) > 0
+    )
 
     hedged_notional = 0.0
     hedged_value = 0.0
-    for hedge in hedges:
+    # 锁汇总量超过敞口时要截断，那就必须定死"先用哪一笔"。
+    # 原来按记录插入顺序截断，两笔价格不同的锁汇换个录入次序，
+    # 结汇均价就变了——同样的经济头寸给出不同的绩效。按交易日先进先出。
+    for hedge in sorted(
+        hedges,
+        key=lambda row: (str(row.get("trade_date") or ""), str(row.get("id") or "")),
+    ):
         amount = offsetting_amount(hedge, gross_signed)
         rate = float(hedge.get("locked_rate", 0) or 0)
         if amount <= 0 or rate <= 0:
@@ -152,7 +177,12 @@ def benchmark_row(
         hedged_value += usable * rate
 
     unhedged = max(0.0, notional - hedged_notional)
-    realized_avg = (hedged_value + unhedged * actual_rate) / notional
+    if notional > 0:
+        realized_avg = (hedged_value + unhedged * actual_rate) / notional
+    else:
+        # 一分钱都没结算，"结汇均价"没有意义。取基准值，让下面两项效应
+        # 自然归零——真正要报的是量差和超额套保，不是价格。
+        realized_avg = float(average_rate)
     sign = 1.0 if gross_signed > 0 else -1.0
 
     # 两因子归因：套保把价格从"到期即期"挪到了"结汇均价"；
@@ -165,6 +195,7 @@ def benchmark_row(
         "currency": currency,
         "notional": notional,
         "hedged_notional": hedged_notional,
+        "offsetting_total": offsetting_total,
         "hedge_coverage": hedged_notional / notional if notional else 0.0,
         "realized_avg_rate": realized_avg,
         "actual_rate": actual_rate,

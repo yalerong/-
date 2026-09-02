@@ -29,6 +29,14 @@ def _period_end(period: str) -> date:
     return date(year, month + 1, 1).fromordinal(date(year, month + 1, 1).toordinal() - 1)
 
 
+def period_end_iso(period: str) -> str:
+    """该期间月末，ISO 日期。远期定价、会计科目、生成的锁汇单共用这一个日期。"""
+    try:
+        return _period_end(period).isoformat()
+    except (ValueError, IndexError):
+        return f"{period}-28"
+
+
 def tenor_years(period: str, today: date | None = None) -> float:
     """从今天到该期间月末的年限，最少给一天，不给负数。"""
     today = today or date.today()
@@ -54,6 +62,19 @@ def forward_rate(
       cip    —— 用利差推的
       spot   —— 缺利率，退回即期，并在 note 里说明
     """
+    t = tenor_years(period, today)
+    if t <= 0:
+        # 到期日已过就没有远期可言。这一步必须在读报价之前——
+        # 配置里留着的旧报价会把已经过期的期间标成「银行报价」，
+        # 拿一个作废的价格去算中性情景损益。
+        return {
+            "rate": spot,
+            "points": 0.0,
+            "basis": "spot",
+            "tenor_years": 0.0,
+            "note": "到期日已过或就在今天，远期点为 0",
+        }
+
     overrides = config.get("forward_overrides") or {}
     for key, needs_dict in ((f"{period}:{currency}", False), (period, True)):
         value = overrides.get(key)
@@ -73,7 +94,7 @@ def forward_rate(
                     "rate": rate,
                     "points": rate - spot,
                     "basis": "quote",
-                    "tenor_years": tenor_years(period, today),
+                    "tenor_years": t,
                     "note": "银行远期报价（配置里录入）",
                 }
 
@@ -81,16 +102,16 @@ def forward_rate(
     base_currency = config.get("base_currency", "CNY")
     i_base = rates.get(base_currency)
     i_foreign = rates.get(currency)
-    t = tenor_years(period, today)
 
-    if i_base is None or i_foreign is None or t <= 0:
+    if i_base is None or i_foreign is None:
         missing = [name for name, value in ((base_currency, i_base), (currency, i_foreign)) if value is None]
-        note = (
-            f"缺 {'/'.join(missing)} 的利率，暂用即期价"
-            if missing
-            else "到期日已过或就在今天，远期点为 0"
-        )
-        return {"rate": spot, "points": 0.0, "basis": "spot", "tenor_years": t, "note": note}
+        return {
+            "rate": spot,
+            "points": 0.0,
+            "basis": "spot",
+            "tenor_years": t,
+            "note": f"缺 {'/'.join(missing)} 的利率，暂用即期价",
+        }
 
     rate = spot * (1 + float(i_base) * t) / (1 + float(i_foreign) * t)
     return {
