@@ -43,6 +43,17 @@ class ForwardRateTest(unittest.TestCase):
         self.assertEqual(result["basis"], "quote")
         self.assertEqual(result["rate"], 7.05)
 
+    def test_bare_period_override_must_name_the_currency(self):
+        # {"2026-12": 7.05} 是个美元报价，套到欧元上会差 10% 还标着「银行报价」
+        config = dict(CONFIG, forward_overrides={"2026-12": 7.05})
+        result = forwards.forward_rate(7.8, "EUR", "2026-12", config, today=TODAY)
+        self.assertNotEqual(result["basis"], "quote")
+        # 写成 {月份: {币种: 报价}} 才生效
+        config = dict(CONFIG, forward_overrides={"2026-12": {"EUR": 7.7}})
+        result = forwards.forward_rate(7.8, "EUR", "2026-12", config, today=TODAY)
+        self.assertEqual(result["basis"], "quote")
+        self.assertEqual(result["rate"], 7.7)
+
     def test_missing_interest_rate_falls_back_to_spot_and_says_so(self):
         config = dict(CONFIG, interest_rates={"CNY": 0.02})
         result = forwards.forward_rate(7.2, "EUR", "2026-12", config, today=TODAY)
@@ -96,7 +107,7 @@ class MonthlyBenchmarkTest(unittest.TestCase):
         # 结汇均价就是 7.30，比月均好 0.20/美元
         row = benchmarks.benchmark_row(
             "2026-06", "USD", gross_signed=1000.0,
-            hedges=[{"amount": 1000, "locked_rate": 7.30}],
+            hedges=[{"amount": 1000, "locked_rate": 7.30, "action": "sell_foreign"}],
             actual_rate=7.00, average_rate=7.10, average_source="test",
         )
         self.assertAlmostEqual(row["realized_avg_rate"], 7.30, places=10)
@@ -108,7 +119,7 @@ class MonthlyBenchmarkTest(unittest.TestCase):
         # 半额锁 7.30，另一半按到期 7.00 结：均价 7.15
         row = benchmarks.benchmark_row(
             "2026-06", "USD", gross_signed=1000.0,
-            hedges=[{"amount": 500, "locked_rate": 7.30}],
+            hedges=[{"amount": 500, "locked_rate": 7.30, "action": "sell_foreign"}],
             actual_rate=7.00, average_rate=7.10, average_source="test",
         )
         self.assertAlmostEqual(row["realized_avg_rate"], 7.15, places=10)
@@ -122,7 +133,7 @@ class MonthlyBenchmarkTest(unittest.TestCase):
         # 净付：结汇均价越低越好，所以同样的价格关系要给出相反的符号
         row = benchmarks.benchmark_row(
             "2026-06", "EUR", gross_signed=-1000.0,
-            hedges=[{"amount": 1000, "locked_rate": 7.30}],
+            hedges=[{"amount": 1000, "locked_rate": 7.30, "action": "buy_foreign"}],
             actual_rate=7.00, average_rate=7.10, average_source="test",
         )
         self.assertAlmostEqual(row["vs_benchmark_cny"], -200.0, places=6)
@@ -132,11 +143,43 @@ class MonthlyBenchmarkTest(unittest.TestCase):
         # 锁了 2000 但敞口只有 1000：多锁的那部分是另一回事，不算进这笔业务的均价
         row = benchmarks.benchmark_row(
             "2026-06", "USD", gross_signed=1000.0,
-            hedges=[{"amount": 2000, "locked_rate": 7.30}],
+            hedges=[{"amount": 2000, "locked_rate": 7.30, "action": "sell_foreign"}],
             actual_rate=7.00, average_rate=7.10, average_source="test",
         )
         self.assertEqual(row["hedged_notional"], 1000.0)
         self.assertAlmostEqual(row["realized_avg_rate"], 7.30, places=10)
+
+    def test_wrong_direction_hedge_is_not_coverage(self):
+        # 收汇敞口配 buy_foreign 不是套保，是把敞口做得更大。
+        # 以前只取 abs(amount)，这笔会被算成 100% 覆盖，
+        # 于是同一张卡上交易员口径和司库口径给出相反的符号。
+        row = benchmarks.benchmark_row(
+            "2026-06", "USD", gross_signed=1000.0,
+            hedges=[{"amount": 1000, "locked_rate": 7.30, "action": "buy_foreign"}],
+            actual_rate=7.00, average_rate=7.10, average_source="test",
+        )
+        self.assertEqual(row["hedged_notional"], 0.0)
+        self.assertEqual(row["hedge_coverage"], 0.0)
+        self.assertAlmostEqual(row["realized_avg_rate"], 7.00, places=10)
+        self.assertAlmostEqual(row["hedge_effect_cny"], 0.0, places=6)
+
+    def test_missing_action_is_not_counted_as_coverage(self):
+        # 方向不明就不能声称覆盖了敞口
+        row = benchmarks.benchmark_row(
+            "2026-06", "USD", gross_signed=1000.0,
+            hedges=[{"amount": 1000, "locked_rate": 7.30}],
+            actual_rate=7.00, average_rate=7.10, average_source="test",
+        )
+        self.assertEqual(row["hedged_notional"], 0.0)
+
+    def test_bare_period_key_must_name_the_currency(self):
+        # {"2026-06": 7.11} 是个美元价，不能套到日元头上
+        state = {"monthly_average_rates": {"2026-06": 7.11}}
+        self.assertEqual(benchmarks.monthly_average(state, "2026-06", "JPY"), (None, None))
+        # 写成 {月份: {币种: 价}} 才生效
+        state = {"monthly_average_rates": {"2026-06": {"JPY": 0.049}}}
+        rate, _ = benchmarks.monthly_average(state, "2026-06", "JPY")
+        self.assertEqual(rate, 0.049)
 
     def test_no_benchmark_means_no_row(self):
         self.assertIsNone(benchmarks.benchmark_row(

@@ -55,10 +55,14 @@ def forward_rate(
       spot   —— 缺利率，退回即期，并在 note 里说明
     """
     overrides = config.get("forward_overrides") or {}
-    for key in (f"{period}:{currency}", period):
+    for key, needs_dict in ((f"{period}:{currency}", False), (period, True)):
         value = overrides.get(key)
+        # 只写月份不写币种的 key，值必须是 {币种: 报价}。
+        # {"2027-06": 7.05} 是个美元报价，套到欧元上会差 10% 还标着「银行报价」。
         if isinstance(value, dict):
             value = value.get(currency)
+        elif needs_dict:
+            continue
         if value:
             try:
                 rate = float(value)

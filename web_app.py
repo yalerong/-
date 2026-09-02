@@ -6,7 +6,7 @@ import mimetypes
 import threading
 import uuid
 from collections import defaultdict
-from datetime import datetime, timezone
+from datetime import date as dt_date, datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import urlparse
@@ -474,7 +474,12 @@ def scenario_projection(
     return rows
 
 
-def build_dashboard(state: dict, rates_cache: dict, forecast_doc: dict | None = None) -> dict:
+def build_dashboard(
+    state: dict,
+    rates_cache: dict,
+    forecast_doc: dict | None = None,
+    today: dt_date | None = None,
+) -> dict:
     pair_rates = rates_cache.get("pair_rates", {})
     exposures = state.get("exposures", [])
     hedges = state.get("hedges", [])
@@ -504,7 +509,7 @@ def build_dashboard(state: dict, rates_cache: dict, forecast_doc: dict | None = 
         target_ratio = hedge_ratio_for(config, period, currency)
         category = exposure_category_for(exposures, period, currency)
         # 远期结汇不是按即期价成交的，交易价要用远期价
-        fwd = forwards.forward_rate(rate, currency, period, config)
+        fwd = forwards.forward_rate(rate, currency, period, config, today=today)
         trade_rate = fN(fwd["rate"], 6)
         # 到期日已过的敞口还留在建议里，说明它没被处理掉——不自动删，但要标出来
         past_due = fwd["tenor_years"] <= 0
@@ -667,9 +672,17 @@ def build_portfolio(net_rows: list[dict], suggestions: list[dict]) -> dict:
                 missing_rate.append(currency)
             continue
         rate = float(row["current_rate"])
-        bucket["gross_cny"] += abs(float(row["business_exposure"])) * rate
-        bucket["locked_cny"] += abs(float(row["locked_exposure"])) * rate
-        bucket["net_cny"] += abs(float(row["net_exposure"])) * rate
+        gross = float(row["business_exposure"])
+        locked = float(row["locked_exposure"])
+        # 只有方向相反的锁汇才算"锁掉了"，而且最多锁到敞口本身那么多。
+        # 直接取 abs(locked) 的话，同向的锁汇（那不是套保，是加仓）会被算成覆盖，
+        # 结果是 已锁 + 剩余 ≠ 业务敞口、剩余 > 业务敞口、覆盖率虚高。
+        offset = 0.0
+        if gross * locked < 0:
+            offset = min(abs(locked), abs(gross))
+        bucket["gross_cny"] += abs(gross) * rate
+        bucket["locked_cny"] += offset * rate
+        bucket["net_cny"] += (abs(gross) - offset) * rate
         bucket["recommended_cny"] += recommended_by_key.get((row["period"], currency), 0.0) * rate
 
     rows = []
@@ -783,6 +796,9 @@ def build_backtest(
         if benchmark:
             benchmark = {
                 **benchmark,
+                # 未结算时 actual_rate 是拿当前市场价试算的，
+                # 由它推出来的结汇均价和归因同样是试算值，不能当结算结果读
+                "settled": settled,
                 "notional": f2(benchmark["notional"]),
                 "hedged_notional": f2(benchmark["hedged_notional"]),
                 "hedge_coverage": fN(benchmark["hedge_coverage"], 4),
@@ -1022,7 +1038,15 @@ def validate_exposure(row: dict) -> None:
             "exposure category must be one of " + "/".join(EXPOSURE_CATEGORIES) + f"; got {category!r}"
         )
     row["category"] = category
-    probability = float(row.get("probability", 1) or 1)
+    raw_probability = row.get("probability")
+    # 不能写成 `or 1`：0 是假值，会被悄悄换成 1，
+    # 等于把一笔已取消的订单按全额记进敞口，而校验根本不会触发。
+    if raw_probability is None or raw_probability == "":
+        raw_probability = 1
+    try:
+        probability = float(raw_probability)
+    except (TypeError, ValueError):
+        raise ValueError("probability must be a number in (0, 1]") from None
     if not 0 < probability <= 1:
         raise ValueError("probability must be in (0, 1]")
     row["probability"] = probability

@@ -565,10 +565,22 @@ const AUDIT_COLLECTIONS = {
   workspace: "整个工作区",
 };
 
+// 配置里有三个字典型的键（interest_rates / forward_overrides / scenario_shifts），
+// 直接 String() 会渲染成 [object Object]——审计日志号称是唯一能回答
+// "把哪条改成了什么"的地方，偏偏对新加的这几个键答不上来。
+function auditValue(value) {
+  if (value === null || value === undefined) return "空";
+  if (typeof value === "object") {
+    const text = JSON.stringify(value);
+    return text.length > 120 ? text.slice(0, 117) + "…" : text;
+  }
+  return String(value);
+}
+
 function auditSummary(row) {
   if (row.collection === "config") {
     const changes = Object.entries(row.after || {})
-      .map(([key, value]) => `${escapeHtml(key)}：${escapeHtml(value.from)} → ${escapeHtml(value.to)}`);
+      .map(([key, value]) => `${escapeHtml(key)}：${escapeHtml(auditValue(value.from))} → ${escapeHtml(auditValue(value.to))}`);
     return changes.length ? changes.join("；") : "无实际变化";
   }
   if (row.collection === "workspace") return "工作区被重置为样例数据";
@@ -594,7 +606,7 @@ function renderAudit(rows) {
       <td>${escapeHtml(fmtTime(row.at))}</td>
       <td>${escapeHtml(AUDIT_ACTIONS[row.action] || row.action)}</td>
       <td>${escapeHtml(AUDIT_COLLECTIONS[row.collection] || row.collection)}</td>
-      <td class="col-note" title="${escapeHtml(auditSummary(row).replace(/<[^>]*>/g, ""))}">${auditSummary(row)}</td>
+      <td class="col-note" title="${auditSummary(row).replace(/<[^>]*>/g, "")}">${auditSummary(row)}</td>
     </tr>
   `).join("");
 }
@@ -608,9 +620,12 @@ function renderBenchmark(bench) {
   const total = Number(bench.vs_benchmark_cny);
   const cls = total >= 0 ? "positive" : "negative";
   const word = total >= 0 ? "好于" : "差于";
+  const provisional = bench.settled === false
+    ? ' <span class="warn-tag" title="到期实际汇率还没录入，结汇均价和归因都是按当前市场价试算的">试算</span>'
+    : "";
   return `
     <div class="bench-block">
-      <p>司库口径：结汇均价 <b>${bench.realized_avg_rate}</b>，当月月均 <b>${bench.average_rate}</b>，
+      <p>司库口径${provisional}：结汇均价 <b>${bench.realized_avg_rate}</b>，当月月均 <b>${bench.average_rate}</b>，
         合计<span class="${cls}">${word} ${money(Math.abs(total))} CNY</span></p>
       <p class="meta">
         拆开看：套保效应 ${money(bench.hedge_effect_cny)}（锁汇把价格从到期即期挪到了结汇均价）、

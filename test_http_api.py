@@ -130,6 +130,8 @@ class HttpApiTest(unittest.TestCase):
                           "direction": "receipt", "category": "export_order"}),
             ("概率越界", {"due_date": "2026-09-30", "currency": "USD", "amount": 100,
                           "direction": "receipt", "probability": 1.5}),
+            ("概率为零", {"due_date": "2026-09-30", "currency": "USD", "amount": 100,
+                          "direction": "receipt", "probability": 0}),
         ]
         for name, payload in cases:
             with self.subTest(name):

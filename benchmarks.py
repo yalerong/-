@@ -31,13 +31,25 @@ MARKET_SERIES = {
     ],
 }
 
-_CACHE: dict[str, dict[str, float]] = {}
+_CACHE: dict[str, tuple[object, dict[str, float]]] = {}
 
 
 def _monthly_means(filename: str) -> dict[str, float]:
-    if filename in _CACHE:
-        return _CACHE[filename]
+    """行情文件的月均，按 (文件大小, mtime) 缓存。
+
+    以前只按文件名缓存，且失败也缓存：服务是长驻的，首次加载时文件还没拉下来，
+    之后跑 events/cn_fetch.py 补上也没用——页面会一直显示「无月均基准」
+    直到重启，而且不给任何提示。
+    """
     path = MARKET_DIR / filename
+    try:
+        stat = path.stat()
+        stamp = (stat.st_size, stat.st_mtime_ns)
+    except OSError:
+        stamp = None
+    cached = _CACHE.get(filename)
+    if cached is not None and cached[0] == stamp:
+        return cached[1]
     buckets: dict[str, list[float]] = defaultdict(list)
     if path.exists():
         try:
@@ -57,17 +69,22 @@ def _monthly_means(filename: str) -> dict[str, float]:
         except OSError:
             buckets = defaultdict(list)
     means = {period: sum(values) / len(values) for period, values in buckets.items() if values}
-    _CACHE[filename] = means
+    _CACHE[filename] = (stamp, means)
     return means
 
 
 def monthly_average(state: dict, period: str, currency: str) -> tuple[float | None, str | None]:
     """返回 (月均汇率, 来源说明)；取不到就是 (None, None)。"""
     manual = (state.get("monthly_average_rates") or {})
-    for key in (f"{period}:{currency}", period):
+    for key, needs_dict in ((f"{period}:{currency}", False), (period, True)):
         value = manual.get(key)
+        # 只写月份不写币种的那种 key，值必须是 {币种: 汇率}。
+        # 否则 {"2026-06": 7.11}（一个美元价）会被当成日元、欧元的月均，
+        # 差出一个数量级还不报错。
         if isinstance(value, dict):
             value = value.get(currency)
+        elif needs_dict:
+            continue
         if value:
             try:
                 return float(value), "财务录入的记账月均汇率"
@@ -80,6 +97,24 @@ def monthly_average(state: dict, period: str, currency: str) -> tuple[float | No
             return value, label
 
     return None, None
+
+
+def offsetting_amount(hedge: dict, gross_signed: float) -> float:
+    """这笔锁汇里，真正对冲掉敞口的名义金额。
+
+    方向不对的锁汇**一分都不算覆盖**：收汇敞口配 buy_foreign 不是套保，
+    是把敞口做得更大。以前这里只取 abs(amount)，结果同一张卡上交易员口径
+    说亏了、司库口径说赚了，覆盖率还显示 41.67%——而实际覆盖是 0。
+    """
+    amount = abs(float(hedge.get("amount", 0) or 0))
+    if amount <= 0:
+        return 0.0
+    action = hedge.get("action")
+    if gross_signed > 0:
+        return amount if action == "sell_foreign" else 0.0
+    if gross_signed < 0:
+        return amount if action == "buy_foreign" else 0.0
+    return 0.0
 
 
 def benchmark_row(
@@ -105,7 +140,7 @@ def benchmark_row(
     hedged_notional = 0.0
     hedged_value = 0.0
     for hedge in hedges:
-        amount = abs(float(hedge.get("amount", 0) or 0))
+        amount = offsetting_amount(hedge, gross_signed)
         rate = float(hedge.get("locked_rate", 0) or 0)
         if amount <= 0 or rate <= 0:
             continue
