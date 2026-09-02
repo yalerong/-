@@ -185,6 +185,31 @@ class HttpApiTest(unittest.TestCase):
         config_change = next(row for row in audit if row["collection"] == "config")
         self.assertEqual(config_change["after"]["risk_limit_cny"]["to"], 12345)
 
+    def test_one_oversized_entry_does_not_blank_the_whole_log(self):
+        """尾部窗口读不到完整记录时要退回整份读。
+
+        reset 那种条目会把整个工作区连同全部方案快照塞进 before/after，
+        单条就可能超过 256KB 的尾部窗口。那时尾部里一条完整记录都没有，
+        直接返回空等于「变更记录」整块凭空消失。
+        """
+        request("POST", f"{self.base}/api/exposures", {
+            "due_date": "2026-08-31", "currency": "USD", "amount": 123,
+            "direction": "receipt", "category": "cash_flow",
+        })
+        _, before = request("GET", f"{self.base}/api/state")
+        self.assertTrue(before["audit"], "前置条件：日志里应该已经有记录")
+
+        # 追加一条超过尾部窗口的巨型记录
+        giant = {"at": "2026-08-31T00:00:00Z", "action": "reset", "collection": "workspace",
+                 "id": None, "before": {"blob": "x" * (web_app.AUDIT_TAIL_BYTES + 5000)},
+                 "after": None}
+        with web_app.AUDIT_LOG_FILE.open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps(giant) + chr(10))
+
+        _, after = request("GET", f"{self.base}/api/state")
+        self.assertTrue(after["audit"], "一条超大记录不该把整段历史读没了")
+        self.assertEqual(after["audit"][0]["action"], "reset")
+
     def test_failed_validation_leaves_no_audit_entry(self):
         _, before = request("GET", f"{self.base}/api/state")
         request("POST", f"{self.base}/api/exposures", {"currency": "USD"})

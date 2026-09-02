@@ -202,14 +202,37 @@ def read_audit(limit: int = 50) -> list[dict]:
     except OSError:
         return []
 
-    text = chunk.decode("utf-8", errors="ignore")
+    rows = _parse_audit_lines(chunk.decode("utf-8", errors="ignore"), truncated=start > 0, limit=limit)
+    if not rows and start > 0:
+        # 单条记录就可能超过尾部窗口（reset 会把整个工作区连同全部方案
+        # 快照塞进 before/after）。这时尾部里一条完整记录都没有，
+        # 直接返回空等于整块「变更记录」凭空消失——退回整份读。
+        try:
+            rows = _parse_audit_lines(
+                AUDIT_LOG_FILE.read_text(encoding="utf-8", errors="ignore"),
+                truncated=False,
+                limit=limit,
+            )
+        except OSError:
+            return []
+    return rows[-limit:][::-1]
+
+
+def _parse_audit_lines(text: str, truncated: bool, limit: int) -> list[dict]:
     lines = text.split("\n")
-    if start > 0 and lines:
-        # 从中间截断的第一行多半是半截的，丢掉
-        lines.pop(0)
+    if truncated and lines:
+        # 从中间截断的第一行多半是半截的。但只在它真的解析不出来时才丢，
+        # 不要无条件丢——正好卡在换行边界时会白扔一条完整记录。
+        head = lines[0].strip()
+        if head:
+            try:
+                json.loads(head)
+            except json.JSONDecodeError:
+                lines.pop(0)
 
     rows: list[dict] = []
-    for line in lines[-(limit * 4):]:
+    tail = lines[-(limit * 4):] if limit > 0 else lines
+    for line in tail:
         line = line.strip()
         if not line:
             continue
@@ -218,7 +241,7 @@ def read_audit(limit: int = 50) -> list[dict]:
         except json.JSONDecodeError:
             # 单行坏了不能让整段历史读不出来
             continue
-    return rows[-limit:][::-1]
+    return rows
 
 
 def merged_config(state: dict) -> dict:
@@ -844,10 +867,20 @@ def build_backtest(
     # 但用户填的 actual_amount 是真实结算金额。两者直接相减的话，
     # 一笔概率 60% 的 100 万订单全额兑现，会被报成"多发生 40 万"的量差收益——
     # 那是凭空造出来的。
-    nominal_by_key: dict[tuple[str, str], float] = defaultdict(float)
+    # 必须**带方向**净额，不能把收和付的绝对值相加：gross_signed 是净额，
+    # 拿一个毛额去和它比会凭空造出量差——一个月收 100 万、付 40 万，
+    # 净敞口 60 万，若计划侧记成 140 万，实际结算 60 万就会被报成
+    # "订单缩水 80 万"，在一个专门用来避免误判缩水的模块里。
+    nominal_signed: dict[tuple[str, str], float] = defaultdict(float)
     for row in exposures:
         key = (period_from_date(row.get("due_date", "")), row.get("currency", "").upper())
-        nominal_by_key[key] += abs(float(row.get("amount", 0) or 0))
+        amount = abs(float(row.get("amount", 0) or 0))
+        direction = row.get("direction")
+        if direction in {"receipt", "asset", "export"}:
+            nominal_signed[key] += amount
+        elif direction in {"payment", "liability", "import"}:
+            nominal_signed[key] -= amount
+    nominal_by_key = {key: abs(value) for key, value in nominal_signed.items()}
 
     actual_amount_by_key = {
         key: float(row["actual_amount"])
@@ -1209,7 +1242,11 @@ def validate_exposure(row: dict) -> None:
     if not 0 < probability <= 1:
         raise ValueError("probability must be in (0, 1]")
     row["probability"] = probability
-    row["booked"] = bool(row.get("booked"))
+    booked = row.get("booked")
+    if isinstance(booked, str):
+        # JSON 客户端传 "false" 时 bool("false") 是 True
+        booked = booked.strip().lower() not in {"", "false", "0", "no"}
+    row["booked"] = bool(booked)
     # 后端也算一遍推荐，这样绕过浏览器的 API 客户端同样能拿到，
     # 而不是只有表单里有提示。
     suggested, reason = suggest_category(row)

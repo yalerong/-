@@ -135,6 +135,10 @@ def drift(
         currency = row.get("currency")
         if currency in signal_changed:
             continue
+        if "forecast_signal" not in row:
+            # 加这个字段之前冻的老方案没有它。拿 None 去比会永远报
+            # "预测信号已变 空 → {...}"，而且除了重新冻一份没别的办法消掉。
+            continue
         before = row.get("forecast_signal")
         after = _signal_fingerprint(signals.get(currency))
         change = _diff_value(before, after)

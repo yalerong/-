@@ -113,6 +113,17 @@ class PlanSnapshotTest(unittest.TestCase):
         result = plans.drift(plan, config, RATES["pair_rates"])
         self.assertFalse(result["stale"])
 
+    def test_plans_frozen_before_the_field_existed_are_not_stale(self):
+        """加 forecast_signal 之前冻的老方案不能被永久误报过期。"""
+        plan = plans.freeze(dashboard(self.state), None, "2026-05-12T00:00:00Z")
+        for row in plan["rows"]:
+            row.pop("forecast_signal", None)
+        signals = {"USD": {"tier": "support", "direction": "up", "mape": 0.018,
+                           "n_test": 30, "direction_accuracy": 0.62}}
+        result = plans.drift(plan, dict(web_app.DEFAULT_CONFIG), RATES["pair_rates"], signals)
+        self.assertEqual(result["signal_changed"], {})
+        self.assertFalse(result["stale"])
+
     def test_no_plan_yet(self):
         self.assertEqual(plans.drift(None, {}, {}), {"has_plan": False})
 
@@ -254,6 +265,87 @@ class RealizedOnActualTest(unittest.TestCase):
         # 只收到 400 却锁了 900，有 500 是裸空头
         self.assertTrue(var["over_hedged"])
         self.assertAlmostEqual(var["over_hedged_notional"], 500.0, places=6)
+
+
+class CancelledOrderTest(unittest.TestCase):
+    def test_zero_actual_amount_still_produces_a_row(self):
+        """订单彻底黄了（实际发生额 0）恰恰最该看到超额套保警告。
+
+        表单占位符就写着"订单黄了就填 0"。用 notional <= 0 去判空的话，
+        整个司库口径块会消失——在 80 万远期还得交割的时候把面板清空。
+        """
+        row = benchmarks.benchmark_row(
+            "2026-06", "USD", gross_signed=1000000.0,
+            hedges=[{"amount": 800000, "locked_rate": 7.2, "action": "sell_foreign",
+                     "trade_date": "2026-05-01"}],
+            actual_rate=7.3, average_rate=7.15, average_source="test",
+            actual_notional=0.0,
+        )
+        self.assertIsNotNone(row, "实际发生额为 0 不等于没数据")
+        self.assertEqual(row["notional"], 0.0)
+        self.assertEqual(row["offsetting_total"], 800000.0)
+        # 一分钱没结算，价格类效应归零
+        self.assertEqual(row["hedge_effect_cny"], 0.0)
+        self.assertEqual(row["timing_effect_cny"], 0.0)
+
+        var = variance.decompose(
+            planned_notional=1000000, actual_notional=0,
+            realized_avg_rate=row["realized_avg_rate"], benchmark_rate=7.15,
+            hedged_notional=row["offsetting_total"], gross_signed=1000000,
+        )
+        self.assertTrue(var["over_hedged"])
+        self.assertEqual(var["over_hedged_notional"], 800000.0)
+
+    def test_flat_book_has_no_treasury_benchmark(self):
+        # 收付正好抵平：没有净敞口就没有方向，不能默认按付汇方给符号
+        self.assertIsNone(benchmarks.benchmark_row(
+            "2026-06", "USD", gross_signed=0.0, hedges=[],
+            actual_rate=7.3, average_rate=7.2, average_source="test",
+            actual_notional=500000.0,
+        ))
+
+    def test_offsetting_total_counts_every_leg(self):
+        """累加写在带 break 的循环里的话，溢出之后的锁汇根本不会被算进去。"""
+        row = benchmarks.benchmark_row(
+            "2026-06", "USD", gross_signed=1000.0,
+            hedges=[
+                {"amount": 1000, "locked_rate": 7.1, "action": "sell_foreign", "trade_date": "2026-05-01"},
+                {"amount": 300, "locked_rate": 7.2, "action": "sell_foreign", "trade_date": "2026-05-02"},
+                {"amount": 200, "locked_rate": 7.3, "action": "sell_foreign", "trade_date": "2026-05-03"},
+            ],
+            actual_rate=7.0, average_rate=7.1, average_source="test",
+        )
+        self.assertEqual(row["offsetting_total"], 1500.0)
+        self.assertEqual(row["hedged_notional"], 1000.0)
+
+
+class NominalNettingTest(unittest.TestCase):
+    def test_planned_notional_nets_receipts_against_payments(self):
+        """计划侧必须和 gross_signed 同口径净额，否则凭空造出量差。
+
+        六月收 100 万、付 40 万，净敞口 60 万。计划侧若按毛额 140 万记，
+        实际结算 60 万就会被报成"缩水 80 万"——576 万人民币的假损失，
+        而这个模块的存在意义正是避免误判缩水。
+        """
+        state = copy.deepcopy(web_app.DEMO_STATE)
+        state["exposures"] = [
+            {"id": "e1", "due_date": "2026-06-30", "currency": "USD", "amount": 1000000,
+             "direction": "receipt", "category": "cash_flow", "probability": 1},
+            {"id": "e2", "due_date": "2026-06-15", "currency": "USD", "amount": 400000,
+             "direction": "payment", "category": "cash_flow", "probability": 1},
+        ]
+        state["hedges"] = []
+        state["settlements"] = [{
+            "id": "s1", "due_date": "2026-06-30", "currency": "USD",
+            "actual_rate": 7.2, "actual_amount": 600000,
+        }]
+        state["monthly_average_rates"] = {"2026-06:USD": 7.2}
+        row = next(r for r in dashboard(state)["backtest"] if r["currency"] == "USD")
+        var = row["benchmark"]["variance"]
+
+        self.assertEqual(var["planned_notional"], 600000)
+        self.assertEqual(var["volume_gap"], 0)
+        self.assertEqual(var["volume_variance_cny"], 0)
 
 
 class SettlementPairingTest(unittest.TestCase):

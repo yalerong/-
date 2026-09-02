@@ -137,16 +137,27 @@ def benchmark_row(
     差额对收汇方是"多收的人民币"，对付汇方是"少付的人民币"，
     所以按敞口方向定符号，正数一律表示比基准好。
     """
-    # 结汇均价要按**实际结算的量**算。原来一律按计划敞口算并在计划量上截断，
-    # 实际收到 2000 而计划只有 1000 时，多出来的 1000 就按到期即期价被忽略了，
-    # 均价算错、价差跟着错，超额套保也会被低估。
-    notional = abs(gross_signed) if actual_notional is None else abs(actual_notional)
-    if notional <= 0 or not average_rate:
+    # 没有净敞口就没有方向，符号无从谈起（sign 会把平头寸当成付汇方）。
+    if not average_rate or gross_signed == 0:
         return None
+
+    # 结汇均价要按**实际结算的量**算。原来一律按计划敞口算并在计划量上截断，
+    # 实际收到 2000 而计划只有 1000 时，多出来的 1000 就按到期即期价被忽略了。
+    # 注意判空要看 actual_notional 是不是 None，**不能看量是不是 0**：
+    # 订单彻底黄了就是 0，那恰恰是最该看到超额套保警告的时候，
+    # 把整行 return None 掉等于在最危险的时刻把面板清空。
+    notional = abs(gross_signed) if actual_notional is None else abs(actual_notional)
+
+    # 未截断的对冲总量单独一遍算。写在下面那个带 break 的循环里的话，
+    # 溢出那一笔之后的锁汇根本不会被累加，"未截断"就是句空话。
+    offsetting_total = sum(
+        offsetting_amount(hedge, gross_signed)
+        for hedge in hedges
+        if float(hedge.get("locked_rate", 0) or 0) > 0
+    )
 
     hedged_notional = 0.0
     hedged_value = 0.0
-    offsetting_total = 0.0
     # 锁汇总量超过敞口时要截断，那就必须定死"先用哪一笔"。
     # 原来按记录插入顺序截断，两笔价格不同的锁汇换个录入次序，
     # 结汇均价就变了——同样的经济头寸给出不同的绩效。按交易日先进先出。
@@ -158,8 +169,6 @@ def benchmark_row(
         rate = float(hedge.get("locked_rate", 0) or 0)
         if amount <= 0 or rate <= 0:
             continue
-        # 未截断的对冲总量：算超额套保要用它，用截断后的值永远算不出超额
-        offsetting_total += amount
         # 锁得比敞口多的部分不算进结汇均价——那是超额套保，不是这笔业务的成本
         usable = min(amount, notional - hedged_notional)
         if usable <= 0:
@@ -168,7 +177,12 @@ def benchmark_row(
         hedged_value += usable * rate
 
     unhedged = max(0.0, notional - hedged_notional)
-    realized_avg = (hedged_value + unhedged * actual_rate) / notional
+    if notional > 0:
+        realized_avg = (hedged_value + unhedged * actual_rate) / notional
+    else:
+        # 一分钱都没结算，"结汇均价"没有意义。取基准值，让下面两项效应
+        # 自然归零——真正要报的是量差和超额套保，不是价格。
+        realized_avg = float(average_rate)
     sign = 1.0 if gross_signed > 0 else -1.0
 
     # 两因子归因：套保把价格从"到期即期"挪到了"结汇均价"；
