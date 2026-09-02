@@ -610,11 +610,14 @@ python -m unittest discover -p "test_*.py"
 # demo 页与实现的闸门逻辑对拍
 python demo/parity_check.py
 
+# 模拟「没装第三方包」再跑一遍（CI 的零依赖作业跑的就是这个）
+python run_zero_dep_tests.py
+
 python -m py_compile fx_risk_simulator.py fx_risk_gui.py web_app.py
 node --check web\app.js
 ```
 
-push 和 PR 会由 GitHub Actions（`.github/workflows/tests.yml`）自动跑上面前两条。
+push 和 PR 会由 GitHub Actions（`.github/workflows/tests.yml`）自动跑这几条。**本机装着 pandas，直接 `unittest discover` 测不出零依赖那条路径**——跳过用的装饰器写错了本地也全绿，只有 CI 会红，所以本地也留了一份模拟。
 
 ### 两套实现的关系
 

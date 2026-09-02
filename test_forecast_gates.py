@@ -70,7 +70,6 @@ class ClassifyTierTest(unittest.TestCase):
         self.assertGreater(pipeline.binom_p_one_sided(20, 40), 0.5)
 
 
-@unittest.skipUnless(HAS_PANDAS, "trend_gate 需要 pandas；不装依赖的那条 CI 作业跳过这组")
 class SignalHorizonTest(unittest.TestCase):
     """信号覆盖不到该期间就不该给折扣——和其余四道闸门一样，只降不升。"""
 
@@ -145,6 +144,7 @@ class ActionDirectionTest(unittest.TestCase):
         self.assertFalse(web_app.direction_is_unexpected({"enterprise_type": "comprehensive"}, -1))
 
 
+@unittest.skipUnless(HAS_PANDAS, "trend_gate 需要 pandas；不装依赖的那条 CI 作业跳过这组")
 class TrendGateTest(unittest.TestCase):
     def _series(self, drift):
         # 单调漂移 + 小幅锯齿，确保 ATR 非零
