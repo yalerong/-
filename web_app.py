@@ -390,8 +390,10 @@ def build_dashboard(state: dict, rates_cache: dict, forecast_doc: dict | None = 
 
     net_rows = []
     suggestions = []
+    scenario_rows = []
     scenario_rates = scenario_rates_for(pair_rates, config)
     scenario_summary: dict[str, dict[str, dict]] = {}
+    risk_limit = float(config.get("risk_limit_cny", 0) or 0)
     for period, currency in keys:
         gross = exposure_totals.get((period, currency), 0.0)
         hedged = hedge_totals.get((period, currency), 0.0)
@@ -413,6 +415,8 @@ def build_dashboard(state: dict, rates_cache: dict, forecast_doc: dict | None = 
                 "current_rate": rate,
                 "rate_available": rate_available,
                 "cny_risk": round(cny_risk, 2),
+                # 仅作提示：阈值不参与建议金额的计算，见 README「风险阈值」一节
+                "over_risk_limit": bool(rate_available and risk_limit > 0 and cny_risk > risk_limit),
             }
         )
         signal = forecast_signals.get(currency)
@@ -421,8 +425,39 @@ def build_dashboard(state: dict, rates_cache: dict, forecast_doc: dict | None = 
         target_cover = abs(gross) * effective_ratio
         covered = abs(hedged)
         recommended_amount = max(0.0, target_cover - covered)
+        action = action_for(config, net)
+        bucket = accounting_bucket(category, now_iso()[:10], f"{period}-28")
+
+        # 情景损益对每一行净敞口都算：建议金额为 0 时套保腿为 0，
+        # 但敞口本身的浮动损益依然存在，不能整块消失。
+        projection = scenario_projection(
+            period,
+            currency,
+            net,
+            {
+                "action": action,
+                "recommended_amount": recommended_amount,
+                "trade_rate": rate,
+                "accounting_bucket": bucket,
+            },
+            rate,
+            scenario_rates,
+        )
+        if abs(net) > 0 or recommended_amount > 0:
+            scenario_summary[f"{period}:{currency}"] = projection
+            scenario_rows.append(
+                {
+                    "period": period,
+                    "currency": currency,
+                    "net_exposure": round(net, 2),
+                    "recommended_amount": round(recommended_amount, 2),
+                    "has_recommendation": recommended_amount > 0,
+                    "accounting_bucket": bucket,
+                    "projection": projection,
+                }
+            )
+
         if abs(net) > 0 and recommended_amount > 0:
-            action = action_for(config, net)
             recommendation = {
                 "period": period,
                 "currency": currency,
@@ -440,13 +475,10 @@ def build_dashboard(state: dict, rates_cache: dict, forecast_doc: dict | None = 
                 "forecast_signal": signal,
                 "recommended_amount": round(recommended_amount, 2),
                 "action": action,
-                "accounting_bucket": accounting_bucket(category, now_iso()[:10], f"{period}-28"),
+                "accounting_bucket": bucket,
                 "plain_text": suggestion_text(currency, net, effective_ratio, recommended_amount, action),
+                "scenario_projection": projection,
             }
-            recommendation["scenario_projection"] = scenario_projection(
-                period, currency, net, recommendation, rate, scenario_rates
-            )
-            scenario_summary[f"{period}:{currency}"] = recommendation["scenario_projection"]
             suggestions.append(recommendation)
 
     backtest_rows = build_backtest(exposures, hedges, settlements, pair_rates)
@@ -459,6 +491,7 @@ def build_dashboard(state: dict, rates_cache: dict, forecast_doc: dict | None = 
         "net_exposures": net_rows,
         "suggestions": suggestions,
         "scenario_rates": scenario_rates,
+        "scenario_rows": scenario_rows,
         "scenario_summary": scenario_summary,
         "backtest": backtest_rows,
         "forecast": forecast_doc,
@@ -490,8 +523,12 @@ def build_backtest(exposures: list[dict], hedges: list[dict], settlements: list[
     rows = []
     for key in sorted(set(exposure_totals) | set(hedge_totals) | set(actual_by_key)):
         period, currency = key
-        actual_rate = actual_by_key.get(key) or current_rate(pair_rates, currency)
         market_rate = current_rate(pair_rates, currency)
+        settled_rate = actual_by_key.get(key)
+        settled = settled_rate is not None
+        # 没录到期实际汇率时用当前市场价试算，但必须标出来，
+        # 否则这一行看不出是已结算还是估的。
+        actual_rate = settled_rate if settled else market_rate
         gross = exposure_totals.get(key, 0.0)
         hedge_effect = 0.0
         locked_detail = []
@@ -515,11 +552,16 @@ def build_backtest(exposures: list[dict], hedges: list[dict], settlements: list[
                 "business_exposure": round(gross, 2),
                 "actual_rate": round(actual_rate, 6),
                 "reference_rate": round(market_rate, 6),
+                "settled": settled,
+                "rate_basis": "settlement" if settled else "market_estimate",
                 "hedge_effect_cny": round(hedge_effect, 2),
                 "locked_detail": locked_detail,
                 "plain_text": (
                     f"{period} {currency}: 实际汇率 {actual_rate:.6f}，参考汇率 {market_rate:.6f}，"
                     f"锁汇贡献 {hedge_effect:,.2f} CNY。"
+                    if settled
+                    else f"{period} {currency}: 尚未录入到期实际汇率，暂按当前市场价 {market_rate:.6f} 试算，"
+                    f"锁汇贡献 {hedge_effect:,.2f} CNY（试算值，非结算结果）。"
                 ),
             }
         )
@@ -543,6 +585,10 @@ def build_plain_language(net_rows: list[dict], suggestions: list[dict], backtest
         lines.append(item["plain_text"])
     if backtest_rows:
         lines.append("回测不是预测，它只是回答：如果按已记录锁汇执行，到期后相对实际汇率贡献了多少人民币。")
+        pending = [row for row in backtest_rows if not row.get("settled")]
+        if pending:
+            names = "、".join(f"{row['period']} {row['currency']}" for row in pending)
+            lines.append(f"其中 {names} 还没录入到期实际汇率，用当前市场价试算，数字会随行情变动。")
     return lines
 
 

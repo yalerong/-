@@ -4,7 +4,7 @@
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>外汇风险与锁汇工作台</title>
-    <link rel="stylesheet" href="/web/styles.css?v=5" />
+    <link rel="stylesheet" href="/web/styles.css?v=6" />
   </head>
   <body>
     <header class="topbar">
@@ -76,7 +76,7 @@
       <section class="panel">
         <div class="panel-title">
           <h2>锁汇建议</h2>
-          <p>系统按“剩余敞口 × 当前汇率”估算风险，超过阈值默认建议锁 100%，否则建议先锁 50%。</p>
+          <p>建议金额 = 业务敞口 × 目标套保比例 × 预测折扣 − 已锁金额。目标比例来自配置（可按月份与币种单独覆盖），预测折扣只会调低比例，不会调高。</p>
         </div>
         <div id="suggestions" class="cards"></div>
       </section>
@@ -136,10 +136,11 @@
 
       <section class="panel">
         <h2>配置</h2>
+        <p class="notice">风险阈值只用于在净敞口表里标出偏大的行，不参与任何建议金额的计算。</p>
         <form id="configForm" class="config-form">
           <label>汇率接口 <input name="rate_api_url" /></label>
           <label>缓存小时 <input name="rate_cache_hours" type="number" min="1" step="1" /></label>
-          <label>风险阈值 CNY <input name="risk_limit_cny" type="number" min="0" step="1000" /></label>
+          <label>风险阈值 CNY（仅提示） <input name="risk_limit_cny" type="number" min="0" step="1000" /></label>
           <label>企业类型
             <select name="enterprise_type">
               <option value="comprehensive">综合型</option>
@@ -156,6 +157,6 @@
       </section>
     </main>
 
-    <script src="/web/app.js?v=5"></script>
+    <script src="/web/app.js?v=6"></script>
   </body>
 </html>

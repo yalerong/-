@@ -65,7 +65,7 @@ function renderDashboard(data) {
   renderNetExposure(data.net_exposures || []);
   renderList("exposureRows", data.exposures || [], renderExposure);
   renderList("hedgeRows", data.hedges || [], renderHedge);
-  renderScenarioRows(data.suggestions || []);
+  renderScenarioRows(data.scenario_rows || []);
   renderList("backtestRows", data.backtest || [], renderBacktest);
   renderConfig(data.config || {});
 }
@@ -198,7 +198,9 @@ function renderNetExposure(rows) {
     const rateCell = row.rate_available
       ? `${row.current_rate}`
       : '<span class="warn-tag" title="该币种暂无汇率，人民币金额无法估算">汇率缺失</span>';
-    const riskCell = row.rate_available ? money(row.cny_risk) : "—";
+    const riskCell = row.rate_available
+      ? `${money(row.cny_risk)}${row.over_risk_limit ? ' <span class="warn-tag" title="超过配置的风险阈值，仅作提示">超阈值</span>' : ""}`
+      : "—";
     const tr = document.createElement("tr");
     tr.innerHTML = `
       <td>${row.period}</td>
@@ -215,15 +217,15 @@ function renderNetExposure(rows) {
   });
 }
 
-function renderScenarioRows(suggestions) {
+function renderScenarioRows(entries) {
   const box = document.getElementById("scenarioRows");
   box.innerHTML = "";
-  if (!suggestions.length) {
-    box.innerHTML = '<div class="item">暂无推荐交易，因此没有预计损益场景。</div>';
+  if (!entries.length) {
+    box.innerHTML = '<div class="item">暂无敞口，因此没有预计损益场景。</div>';
     return;
   }
-  suggestions.forEach((item) => {
-    const rows = Object.entries(item.scenario_projection || {}).map(([name, row]) => {
+  entries.forEach((item) => {
+    const rows = Object.entries(item.projection || {}).map(([name, row]) => {
       const bucketValue = row[item.accounting_bucket] || 0;
       return `
         <tr>
@@ -237,9 +239,16 @@ function renderScenarioRows(suggestions) {
     }).join("");
     const div = document.createElement("div");
     div.className = "item";
+    // 建议金额为 0 时套保腿为 0，但敞口本身的浮动损益依然要显示。
+    const title = item.has_recommendation
+      ? `${item.period} ${item.currency} 推荐交易预计损益`
+      : `${item.period} ${item.currency} 当前敞口预计损益`;
+    const note = item.has_recommendation
+      ? `建议金额 ${money(item.recommended_amount)}。`
+      : "无新增建议（已达目标套保比例），下表只反映剩余敞口本身的浮动损益。";
     div.innerHTML = `
-      <strong>${item.period} ${item.currency} 推荐交易预计损益</strong>
-      <p class="meta">科目：${bucketName(item.accounting_bucket)}。中性、乐观、悲观、自定义场景按配置的汇率涨跌幅计算。</p>
+      <strong>${title}</strong>
+      <p class="meta">${note}科目：${bucketName(item.accounting_bucket)}。中性、乐观、悲观、自定义场景按配置的汇率涨跌幅计算。</p>
       <div class="table-wrap">
         <table>
           <thead>
@@ -313,11 +322,16 @@ function renderBacktest(row) {
   const div = document.createElement("div");
   div.className = "item";
   const cls = row.hedge_effect_cny >= 0 ? "positive" : "negative";
+  const settled = row.settled !== false;
+  const tag = settled ? "" : ' <span class="warn-tag" title="尚未录入到期实际汇率，按当前市场价试算">试算</span>';
+  const rateLine = settled
+    ? `实际汇率 ${row.actual_rate}，参考汇率 ${row.reference_rate}`
+    : `未录入实际汇率，按当前市场价 ${row.reference_rate} 试算`;
   div.innerHTML = `
-    <strong>${row.period} ${row.currency}</strong>
+    <strong>${row.period} ${row.currency}</strong>${tag}
     <p>${row.plain_text}</p>
-    <p>锁汇贡献：<span class="${cls}">${money(row.hedge_effect_cny)} CNY</span></p>
-    <p class="meta">业务敞口 ${money(row.business_exposure)}，实际汇率 ${row.actual_rate}，参考汇率 ${row.reference_rate}</p>
+    <p>锁汇贡献${settled ? "" : "（试算）"}：<span class="${cls}">${money(row.hedge_effect_cny)} CNY</span></p>
+    <p class="meta">业务敞口 ${money(row.business_exposure)}，${rateLine}</p>
   `;
   return div;
 }
