@@ -567,3 +567,14 @@ th {
 .row-delete:hover {
   background: #fdf2f0;
 }
+
+.bench-block {
+  margin-top: 10px;
+  padding-top: 10px;
+  border-top: 1px dashed var(--line);
+}
+
+.warn-item {
+  border-left: 3px solid #b4531a;
+  background: #fdf7f2;
+}

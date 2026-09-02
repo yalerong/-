@@ -4,7 +4,7 @@
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>外汇风险与锁汇工作台</title>
-    <link rel="stylesheet" href="/web/styles.css?v=10" />
+    <link rel="stylesheet" href="/web/styles.css?v=11" />
   </head>
   <body>
     <header class="topbar">
@@ -208,7 +208,10 @@
             <button type="submit">保存实际汇率</button>
           </form>
           <section class="panel">
-            <h2>回测结果</h2>
+            <div class="panel-title">
+              <h2>回测结果</h2>
+              <span class="meta">两个口径：对到期即期（交易员）与对月均汇率（司库）</span>
+            </div>
             <div id="backtestRows" class="list"></div>
           </section>
         </section>
@@ -270,6 +273,6 @@
       </main>
     </div>
 
-    <script src="/web/app.js?v=10"></script>
+    <script src="/web/app.js?v=11"></script>
   </body>
 </html>
