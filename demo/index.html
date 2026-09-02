@@ -1,0 +1,642 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<meta name="robots" content="noindex,nofollow,noarchive" />
+<title>FX Hedge Lab · 套保决策台演示</title>
+<style>
+  :root {
+    --bg: #f6f6f4;
+    --panel: #ffffff;
+    --ink: #1b1d21;
+    --ink-2: #4a4f57;
+    --ink-3: #767c86;
+    --line: #e0dfda;
+    --line-2: #c9c8c2;
+    --accent: #1f5f7a;
+    --accent-soft: #e6eff3;
+    --good: #0f6b5c;
+    --good-soft: #e2f0ec;
+    --warn: #9a5518;
+    --warn-soft: #f7ece1;
+    --stop: #8a2f3a;
+    --stop-soft: #f6e6e8;
+    --mono: ui-monospace, "SF Mono", "Cascadia Mono", Menlo, Consolas, monospace;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #14161a;
+      --panel: #1c1f24;
+      --ink: #ecedef;
+      --ink-2: #b6bac1;
+      --ink-3: #838995;
+      --line: #2c3037;
+      --line-2: #3c414a;
+      --accent: #7fc0dc;
+      --accent-soft: #1b2c35;
+      --good: #6fc9b4;
+      --good-soft: #16302b;
+      --warn: #e0a06a;
+      --warn-soft: #33261a;
+      --stop: #e88b96;
+      --stop-soft: #331f22;
+    }
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    background: var(--bg);
+    color: var(--ink);
+    font: 15px/1.65 -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC",
+      "Hiragino Sans GB", "Microsoft YaHei", sans-serif;
+    -webkit-font-smoothing: antialiased;
+  }
+  .wrap { max-width: 940px; margin: 0 auto; padding: 0 22px 96px; }
+
+  header.hero { padding: 56px 0 30px; border-bottom: 1px solid var(--line); }
+  .eyebrow {
+    font: 600 11px/1 var(--mono); letter-spacing: .16em; text-transform: uppercase;
+    color: var(--ink-3); margin-bottom: 16px;
+  }
+  h1 { font-size: 30px; line-height: 1.25; margin: 0 0 12px; letter-spacing: -.01em; }
+  .lede { font-size: 16px; color: var(--ink-2); margin: 0; max-width: 62ch; }
+  .tags { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 22px; }
+  .tag {
+    font: 500 12px/1 var(--mono); color: var(--ink-2); background: var(--panel);
+    border: 1px solid var(--line-2); border-radius: 999px; padding: 6px 11px;
+  }
+
+  section { margin-top: 52px; }
+  h2 {
+    font-size: 12px; font-weight: 600; letter-spacing: .14em; text-transform: uppercase;
+    color: var(--ink-3); margin: 0 0 6px; font-family: var(--mono);
+  }
+  h3 { font-size: 19px; margin: 0 0 10px; letter-spacing: -.005em; }
+  p { margin: 0 0 12px; color: var(--ink-2); }
+  p.tight { margin-bottom: 6px; }
+  strong { color: var(--ink); font-weight: 600; }
+  code {
+    font: 500 13px/1.4 var(--mono); background: var(--accent-soft);
+    color: var(--accent); padding: 1px 5px; border-radius: 4px;
+  }
+
+  .panel {
+    background: var(--panel); border: 1px solid var(--line);
+    border-radius: 10px; padding: 22px 24px; margin-top: 18px;
+  }
+  .panel + .panel { margin-top: 14px; }
+
+  table { width: 100%; border-collapse: collapse; font-size: 14px; }
+  .table-wrap { overflow-x: auto; -webkit-overflow-scrolling: touch; }
+  th {
+    text-align: right; font: 600 11px/1.3 var(--mono); letter-spacing: .06em;
+    color: var(--ink-3); text-transform: uppercase; padding: 0 0 9px;
+    border-bottom: 1px solid var(--line-2); white-space: nowrap;
+  }
+  th:first-child, td:first-child { text-align: left; }
+  td {
+    text-align: right; padding: 10px 0; border-bottom: 1px solid var(--line);
+    font-variant-numeric: tabular-nums; white-space: nowrap;
+  }
+  th + th, td + td { padding-left: 18px; }
+  tr:last-child td { border-bottom: 0; }
+  tfoot td { font-weight: 600; color: var(--ink); border-top: 1px solid var(--line-2); }
+
+  .num { font-family: var(--mono); }
+  .pos { color: var(--good); }
+  .neg { color: var(--warn); }
+  .muted { color: var(--ink-3); }
+
+  .controls { display: flex; flex-wrap: wrap; gap: 26px; align-items: flex-end; }
+  .ctl { flex: 1 1 220px; min-width: 200px; }
+  .ctl label {
+    display: block; font: 600 11px/1 var(--mono); letter-spacing: .08em;
+    text-transform: uppercase; color: var(--ink-3); margin-bottom: 9px;
+  }
+  .ctl output { font: 600 20px/1 var(--mono); color: var(--ink); }
+  input[type="range"] { width: 100%; margin: 10px 0 0; accent-color: var(--accent); }
+  .seg { display: flex; gap: 0; border: 1px solid var(--line-2); border-radius: 7px; overflow: hidden; }
+  .seg button {
+    flex: 1; border: 0; background: var(--panel); color: var(--ink-2);
+    font: 500 13px/1 inherit; padding: 9px 6px; cursor: pointer;
+    border-right: 1px solid var(--line-2);
+  }
+  .seg button:last-child { border-right: 0; }
+  .seg button[aria-pressed="true"] { background: var(--accent); color: #fff; }
+
+  .verdict {
+    display: flex; gap: 16px; align-items: baseline; flex-wrap: wrap;
+    border-radius: 8px; padding: 16px 18px; margin-top: 20px;
+    border: 1px solid transparent;
+  }
+  .verdict.hold { background: var(--stop-soft); border-color: rgba(138,47,58,.28); }
+  .verdict.cut  { background: var(--good-soft); border-color: rgba(15,107,92,.28); }
+  .verdict .mult { font: 700 30px/1 var(--mono); }
+  .verdict.hold .mult { color: var(--stop); }
+  .verdict.cut  .mult { color: var(--good); }
+  .verdict .why { flex: 1 1 320px; font-size: 14px; color: var(--ink-2); }
+  .verdict .why b { color: var(--ink); }
+
+  .gates { list-style: none; margin: 18px 0 0; padding: 0; }
+  .gates li {
+    display: flex; gap: 12px; align-items: flex-start; padding: 9px 0;
+    border-top: 1px solid var(--line); font-size: 14px; color: var(--ink-2);
+  }
+  .gates li:first-child { border-top: 0; }
+  .gates .mark {
+    flex: 0 0 auto; width: 20px; text-align: center;
+    font: 700 13px/1.5 var(--mono);
+  }
+  .gates .fired .mark { color: var(--stop); }
+  .gates .pass .mark { color: var(--ink-3); }
+  .gates .fired { color: var(--ink); }
+
+  .band { margin-top: 20px; }
+  .band-row { display: flex; align-items: center; gap: 14px; margin-bottom: 10px; }
+  .band-label { flex: 0 0 96px; font: 500 12px/1 var(--mono); color: var(--ink-3); }
+  .band-track {
+    position: relative; flex: 1; height: 26px; background: var(--bg);
+    border: 1px solid var(--line); border-radius: 5px;
+  }
+  .band-fill { position: absolute; top: 4px; bottom: 4px; border-radius: 3px; }
+  .band-zero { position: absolute; top: -3px; bottom: -3px; width: 1px; background: var(--line-2); }
+  .band-val { flex: 0 0 130px; text-align: right; font: 500 13px/1 var(--mono); }
+
+  .callout {
+    border-left: 3px solid var(--accent); background: var(--accent-soft);
+    padding: 14px 18px; border-radius: 0 7px 7px 0; margin-top: 18px;
+  }
+  .callout p:last-child { margin-bottom: 0; }
+  .callout.stop { border-left-color: var(--stop); background: var(--stop-soft); }
+
+  .pill {
+    display: inline-block; font: 600 11px/1 var(--mono); letter-spacing: .06em;
+    padding: 4px 8px; border-radius: 4px; text-transform: uppercase;
+  }
+  .pill.fail { background: var(--stop-soft); color: var(--stop); }
+  .pill.ok { background: var(--good-soft); color: var(--good); }
+
+  .kv { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 18px; margin-top: 6px; }
+  .kv div span { display: block; font: 600 11px/1 var(--mono); letter-spacing: .08em; text-transform: uppercase; color: var(--ink-3); margin-bottom: 7px; }
+  .kv div b { font: 600 18px/1.2 var(--mono); }
+
+  footer {
+    margin-top: 64px; padding-top: 22px; border-top: 1px solid var(--line);
+    font-size: 13px; color: var(--ink-3);
+  }
+  footer a { color: var(--accent); }
+  @media (max-width: 620px) {
+    h1 { font-size: 25px; }
+    .wrap { padding: 0 16px 72px; }
+    .panel { padding: 18px 16px; }
+    .band-label { flex-basis: 68px; }
+    .band-val { flex-basis: 104px; font-size: 12px; }
+  }
+</style>
+</head>
+<body>
+<div class="wrap">
+
+<header class="hero">
+  <div class="eyebrow">FX Hedge Lab · 演示</div>
+  <h1>把汇率预测关进闸门里的<br />企业套保决策台</h1>
+  <p class="lede">
+    这个工作台的决策变量是<strong>套保比例</strong>，不是汇率方向。预测不会告诉你"该不该锁"，
+    它只被允许做一件事：在四道闸门全过之后，把已定的目标比例往下打一个折扣。
+    <strong>只降不升</strong>——预测对你不利时，一律足额锁。
+  </p>
+  <div class="tags">
+    <span class="tag">Python 标准库 · 无数据库</span>
+    <span class="tag">75 条测试</span>
+    <span class="tag">合成数据</span>
+    <span class="tag">两轮样本外 · 均登记负结果</span>
+  </div>
+</header>
+
+<section>
+  <h2>01 · 场景</h2>
+  <h3>一家出口为主的企业，6 月有两笔外币现金流</h3>
+  <p>
+    净敞口按"期间 × 币种"汇总，已执行的锁汇直接冲抵业务敞口。下表是这套工具启动后的默认样例状态。
+  </p>
+  <div class="panel">
+    <div class="table-wrap">
+      <table>
+        <thead>
+          <tr>
+            <th>期间 / 币种</th><th>业务敞口</th><th>已锁</th><th>净敞口</th>
+            <th>汇率</th><th>人民币风险</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td>2026-06 · USD<br /><span class="muted" style="font-size:12px">出口订单预计收款</span></td>
+            <td class="num pos">+1,200,000</td><td class="num">−500,000</td>
+            <td class="num pos">+700,000</td><td class="num">7.1500</td>
+            <td class="num">5,005,000</td>
+          </tr>
+          <tr>
+            <td>2026-06 · EUR<br /><span class="muted" style="font-size:12px">进口采购预计付款</span></td>
+            <td class="num neg">−350,000</td><td class="num">0</td>
+            <td class="num neg">−350,000</td><td class="num">7.7200</td>
+            <td class="num">2,702,000</td>
+          </tr>
+        </tbody>
+        <tfoot>
+          <tr><td>合计人民币风险敞口</td><td colspan="4"></td><td class="num">7,707,000</td></tr>
+        </tfoot>
+      </table>
+    </div>
+    <p class="muted" style="margin:14px 0 0;font-size:13px">
+      正号 = 未来净收外币，负号 = 未来净付。汇率为演示用固定值，线上版本按 24 小时缓存拉取。
+    </p>
+  </div>
+</section>
+
+<section>
+  <h2>02 · 决策台</h2>
+  <h3>套保比例不是赌方向，是收窄损益带宽</h3>
+  <p>
+    拖动目标套保比例，看四个情景下的合计损益。比例越高，乐观与悲观两端的差距越小——
+    这就是套保买到的东西：<strong>不是更高的期望，是更窄的分布</strong>。
+  </p>
+
+  <div class="panel">
+    <div class="controls">
+      <div class="ctl">
+        <label for="ratio">目标套保比例</label>
+        <output id="ratioOut">80%</output>
+        <input id="ratio" type="range" min="0" max="1" step="0.05" value="0.8" />
+      </div>
+      <div class="ctl">
+        <label>建议新增锁汇</label>
+        <output id="recOut" style="font-size:15px"></output>
+      </div>
+    </div>
+
+    <div class="band" id="band"></div>
+
+    <div class="table-wrap" style="margin-top:22px">
+      <table>
+        <thead>
+          <tr><th>情景</th><th>USD 合计</th><th>EUR 合计</th><th>两币种合计（CNY）</th></tr>
+        </thead>
+        <tbody id="scenarioRows"></tbody>
+      </table>
+    </div>
+    <p class="muted" style="margin:14px 0 0;font-size:13px">
+      情景 = 当前汇率 ±3%（乐观 / 悲观）与 +1%（自定义）。合计损益 = 敞口浮动损益 + 套保损益，
+      即"剩余未锁部分 × 汇率变动"。
+    </p>
+  </div>
+
+  <div class="callout">
+    <p>
+      <strong>把比例拉到 100%</strong>：四个情景的合计损益全部归零，带宽消失。
+      拉到 42% 以下时建议新增锁汇为 0——已经执行的 50 万美元远期已经覆盖了这个比例，
+      系统不会为了凑比例去反向平仓。
+    </p>
+  </div>
+</section>
+
+<section>
+  <h2>03 · 压轴</h2>
+  <h3>预测折扣闸门：四道闸门，全部只降不升</h3>
+  <p>
+    Prophet 月度预测 + 滚动回测给出一个信号（档位 / 方向 / 幅度 / 误差）。
+    这个信号<strong>永远不能提高</strong>套保比例，最多把它打到 50%。下面四个控件是信号的全部输入，
+    改任意一个，实时看判定与被触发的闸门。
+  </p>
+
+  <div class="panel">
+    <div class="controls">
+      <div class="ctl">
+        <label>模型档位（回测质量）</label>
+        <div class="seg" id="tierSeg">
+          <button type="button" data-v="support">support</button>
+          <button type="button" data-v="caution">caution</button>
+          <button type="button" data-v="reject">reject</button>
+        </div>
+      </div>
+      <div class="ctl">
+        <label>预测方向（USD/CNY）</label>
+        <div class="seg" id="dirSeg">
+          <button type="button" data-v="up">上行（对收汇方有利）</button>
+          <button type="button" data-v="down">下行</button>
+        </div>
+      </div>
+    </div>
+
+    <div class="controls" style="margin-top:24px">
+      <div class="ctl">
+        <label for="move">预测幅度（期末 vs 当前）</label>
+        <output id="moveOut">1.4%</output>
+        <input id="move" type="range" min="0" max="0.05" step="0.001" value="0.0139" />
+      </div>
+      <div class="ctl">
+        <label for="mape">模型自身误差 MAPE</label>
+        <output id="mapeOut">1.8%</output>
+        <input id="mape" type="range" min="0.002" max="0.05" step="0.001" value="0.018" />
+      </div>
+    </div>
+
+    <div class="verdict" id="verdict">
+      <div class="mult" id="multOut">1.00×</div>
+      <div class="why" id="whyOut"></div>
+    </div>
+
+    <ul class="gates" id="gateList"></ul>
+
+    <div class="table-wrap" style="margin-top:20px">
+      <table>
+        <thead><tr><th>项</th><th>目标比例</th><th>折扣</th><th>生效比例</th><th>USD 建议锁汇</th></tr></thead>
+        <tbody>
+          <tr>
+            <td>2026-06 · USD</td>
+            <td class="num" id="tgtCell">80%</td>
+            <td class="num" id="multCell">1.00×</td>
+            <td class="num" id="effCell">80%</td>
+            <td class="num" id="amtCell">460,000</td>
+          </tr>
+        </tbody>
+      </table>
+    </div>
+  </div>
+
+  <div class="callout stop">
+    <p class="tight"><strong>默认状态就是最值得看的那一格。</strong></p>
+    <p>
+      样例信号：档位 <code>support</code>（回测质量达标）、方向上行（对收美元的出口商<em>有利</em>）、
+      预测幅度 <strong>1.4%</strong>、模型自身 MAPE <strong>1.8%</strong>。
+      三个条件里两个都指向"可以少锁一点"，但<strong>信噪比闸门直接否掉</strong>：
+      预测的变动幅度还没跑赢模型自己的平均误差，这个方向判断在噪声里，不足以支撑降低套保。
+      把幅度拖过 1.8%，折扣才会出现。
+    </p>
+  </div>
+
+  <div class="panel">
+    <h3 style="font-size:16px">四道闸门原文</h3>
+    <ul class="gates">
+      <li><span class="mark">1</span><span><b>回测区间覆盖率</b>：可回测区间覆盖名义区间 &lt;80% 降一档，&lt;40% 直接 reject。</span></li>
+      <li><span class="mark">2</span><span><b>样本量与显著性</b>：support 档要求 n≥24 且方向准确率的单侧二项检验 p≤0.10，否则降档。</span></li>
+      <li><span class="mark">3</span><span><b>趋势一致性（GMMA）</b>：六层 EMA 配对 + ATR 归一化算势能，预测方向与强趋势 5/6 相反则降一档。</span></li>
+      <li><span class="mark">4</span><span><b>信噪比</b>：预测幅度 ≤ MAPE 时，即使方向有利也不给折扣。</span></li>
+    </ul>
+    <p style="margin:14px 0 0">
+      四道全部是单向的：任何一道触发只会让套保比例<strong>更高或不变</strong>，没有一条路径能让模型说服你少锁。
+      页面上的判定逻辑与 <code>web_app.py:forecast_multiplier</code> 逐格对拍一致（96 组组合全等）。
+    </p>
+  </div>
+</section>
+
+<section>
+  <h2>04 · 研究线</h2>
+  <h3>两轮样本外，两次负结果，一次被硬约束挡下的"假发现"</h3>
+  <p>
+    第二条线试图用新闻事件预测 USD/CNY 日内方向。规则在跑结果之前 commit 冻结，
+    <strong>git 时间戳是"没有先看行情再挑新闻"的唯一凭证</strong>。两轮样本外各只跑一次，跑完即定论。
+  </p>
+
+  <div class="panel">
+    <div class="table-wrap">
+      <table>
+        <thead><tr><th>轮次</th><th>样本外 n</th><th>命中率</th><th>p 值</th><th>安慰剂</th><th>增量检验</th><th>结论</th></tr></thead>
+        <tbody>
+          <tr>
+            <td>v1 · 新闻事件方向</td><td class="num">207</td><td class="num">53.14%</td>
+            <td class="num">0.2022</td><td class="num">19.9%</td><td class="num">p=0.50</td>
+            <td><span class="pill fail">五条过两条</span></td>
+          </tr>
+          <tr>
+            <td>v1 · 波动目标</td><td class="num">—</td><td class="num muted">比值 0.929</td>
+            <td class="num">0.478</td><td class="num muted">—</td><td class="num muted">—</td>
+            <td><span class="pill fail">三条全不过</span></td>
+          </tr>
+          <tr>
+            <td>v2 · 境内变量 + 新闻筛选</td><td class="num">110</td><td class="num">54.55%</td>
+            <td class="num">0.1955</td><td class="num">18.2%</td><td class="num">p=0.5094</td>
+            <td><span class="pill fail">不通过</span></td>
+          </tr>
+          <tr>
+            <td>v2 · 基线（去掉新闻）</td><td class="num">110</td><td class="num">54.70%</td>
+            <td class="num muted">—</td><td class="num muted">—</td><td class="num muted">—</td>
+            <td><span class="pill fail">比加新闻更高</span></td>
+          </tr>
+        </tbody>
+      </table>
+    </div>
+    <p style="margin:16px 0 0">
+      结论写进仓库：新闻相对于已经能看到的市场变量<strong>没有可验证的增量信息</strong>。
+      未过验收的信号<strong>不接入</strong>上面那个折扣器——原计划的接入 PR 直接取消。
+    </p>
+  </div>
+
+  <div class="callout stop">
+    <p class="tight"><strong>最值得讲的一格：一个 78.6% 的假发现是怎么被挡住的。</strong></p>
+    <p>
+      同一批数据里有一个漂亮得多的数字：<code>r0</code>（事件当日收益）样本外命中 <strong>61.24%</strong>，
+      严格档 <strong>78.57%</strong>，p = 0.0001。
+      但它<strong>不可交易</strong>——r0 与规则的输入变量处于同一时段，
+      "用当天的市场反应去预测当天的市场反应"是同义反复。
+      预注册里那条"意外与响应必须分段测量"的硬约束，单独挡掉了这一个假发现。
+      同样地，v2 里 <code>rF</code> 三条预注册条件<em>字面上全过</em>，仍被否决：
+      零假设选错（该比的是"永远看多"而不是 50%）+ 中间价是参考价不可成交。
+    </p>
+  </div>
+
+  <div class="panel">
+    <div class="kv">
+      <div><span>预注册规则冻结</span><b>3 commit</b></div>
+      <div><span>样本外使用次数</span><b>2 / 已封存</b></div>
+      <div><span>接入生产的信号</span><b>0</b></div>
+      <div><span>登记的负结果</span><b>2 轮</b></div>
+    </div>
+  </div>
+</section>
+
+<section>
+  <h2>05 · 边界</h2>
+  <div class="panel">
+    <ul class="gates">
+      <li><span class="mark pass">·</span><span>本页所有敞口、锁汇、汇率均为<b>合成演示数据</b>，不含任何真实企业的头寸或对手方。</span></li>
+      <li><span class="mark pass">·</span><span>本页是纯静态复刻。真实工具在本地运行（Python 标准库 HTTP 服务 + JSON 文件），<b>没有下单通道</b>，不连银行、不发指令。</span></li>
+      <li><span class="mark pass">·</span><span>预测模块是<b>可选</b>的：信号文件缺失或档位不达标时，系统按目标比例足额锁汇，行为与没有模型时完全一致。</span></li>
+      <li><span class="mark pass">·</span><span>回测回答的是"按已记录的锁汇执行，到期相对实际汇率贡献了多少人民币"，<b>不是预测</b>。</span></li>
+    </ul>
+  </div>
+</section>
+
+<footer>
+  FX Hedge Lab · 演示页 · 合成数据 ·
+  逻辑与仓库实现逐格对拍 · <span class="muted">仅用于方法展示，不构成任何投资或套保建议。</span>
+</footer>
+
+</div>
+
+<script>
+(function () {
+  "use strict";
+
+  var RATE = { USD: 7.15, EUR: 7.72 };
+  var USD = { gross: 1200000, locked: -500000, net: 700000, action: "sell_foreign" };
+  var EUR = { gross: -350000, locked: 0, net: -350000, action: "buy_foreign" };
+  var SHIFTS = [
+    ["中性", 0], ["乐观 +3%", 0.03], ["悲观 −3%", -0.03], ["自定义 +1%", 0.01]
+  ];
+
+  // ---- gate:begin ---- 与 web_app.py:forecast_multiplier 逐行对应，改动必须两侧同步
+  function forecastMultiplier(signal, net) {
+    if (!signal) return [1.0, null];
+    var tier = signal.tier, direction = signal.direction;
+    var unfavorable = net > 0 ? direction === "down" : direction === "up";
+    if (tier !== "support" && tier !== "caution") {
+      return [1.0, "模型质量不达标，忽略预测方向，按目标比例锁汇"];
+    }
+    if (unfavorable) {
+      if (tier === "support") return [1.0, "模型质量达标，预测对你不利，按目标比例锁汇"];
+      return [1.0, "模型质量一般，预测不利，按目标比例锁汇"];
+    }
+    var move = signal.move, mape = signal.mape;
+    if (move !== null && move !== undefined && mape !== null && mape !== undefined && move <= mape) {
+      return [1.0, "预测有利但幅度 " + pct1(move) + " 未超过模型误差 " + pct1(mape) +
+        "，不足以支撑少锁，按目标比例锁汇"];
+    }
+    if (tier === "support") return [0.5, "模型质量达标，预测对你有利，降到目标比例的 50%"];
+    return [0.7, "模型质量一般，预测有利，降到目标比例的 70%"];
+  }
+  // ---- gate:end ----
+
+  function pct1(x) { return (x * 100).toFixed(1) + "%"; }
+  function pct0(x) { return Math.round(x * 100) + "%"; }
+  function pctTrim(x) { return (x * 100).toFixed(1).replace(/\.0$/, "") + "%"; }
+  function money(x) {
+    var s = Math.abs(x) >= 1000 ? Math.round(x) : Math.round(x * 100) / 100;
+    return s.toLocaleString("en-US");
+  }
+  function signed(x) { return (x > 0 ? "+" : x < 0 ? "−" : "") + money(Math.abs(x)); }
+  function cls(x) { return x > 0.5 ? "pos" : x < -0.5 ? "neg" : "muted"; }
+
+  function recommended(leg, ratio, mult) {
+    var cover = Math.abs(leg.gross) * ratio * mult;
+    return Math.max(0, cover - Math.abs(leg.locked));
+  }
+  function legTotal(leg, rate, shift, rec) {
+    var d = rate * shift;
+    var exposurePnl = leg.net * d;
+    var hedgePnl = (leg.action === "sell_foreign" ? -rec : rec) * d;
+    return exposurePnl + hedgePnl;
+  }
+
+  var ratioEl = document.getElementById("ratio");
+  var ratioOut = document.getElementById("ratioOut");
+  var recOut = document.getElementById("recOut");
+  var rowsEl = document.getElementById("scenarioRows");
+  var bandEl = document.getElementById("band");
+
+  function renderDeck() {
+    var ratio = parseFloat(ratioEl.value);
+    ratioOut.textContent = pct0(ratio);
+    // 决策台不叠加预测折扣，只看比例本身的效果
+    var recU = recommended(USD, ratio, 1), recE = recommended(EUR, ratio, 1);
+    recOut.innerHTML = "USD " + money(recU) + " <span class='muted'>卖出</span> · EUR " +
+      money(recE) + " <span class='muted'>买入</span>";
+
+    var totals = [];
+    rowsEl.innerHTML = SHIFTS.map(function (s) {
+      var u = legTotal(USD, RATE.USD, s[1], recU);
+      var e = legTotal(EUR, RATE.EUR, s[1], recE);
+      totals.push([s[0], u + e]);
+      return "<tr><td>" + s[0] + "</td>" +
+        "<td class='num " + cls(u) + "'>" + signed(u) + "</td>" +
+        "<td class='num " + cls(e) + "'>" + signed(e) + "</td>" +
+        "<td class='num " + cls(u + e) + "'>" + signed(u + e) + "</td></tr>";
+    }).join("");
+
+    var span = 0;
+    totals.forEach(function (t) { span = Math.max(span, Math.abs(t[1])); });
+    span = Math.max(span, 1);
+    bandEl.innerHTML = totals.map(function (t) {
+      var w = Math.abs(t[1]) / span * 50;
+      var left = t[1] >= 0 ? 50 : 50 - w;
+      var color = t[1] > 0.5 ? "var(--good)" : t[1] < -0.5 ? "var(--warn)" : "var(--line-2)";
+      return "<div class='band-row'><div class='band-label'>" + t[0] + "</div>" +
+        "<div class='band-track'><div class='band-zero' style='left:50%'></div>" +
+        "<div class='band-fill' style='left:" + left + "%;width:" + Math.max(w, 0.3) + "%;background:" + color + "'></div></div>" +
+        "<div class='band-val " + cls(t[1]) + "'>" + signed(t[1]) + "</div></div>";
+    }).join("");
+  }
+
+  var state = { tier: "support", direction: "up", move: 0.0139, mape: 0.018 };
+  var moveEl = document.getElementById("move");
+  var mapeEl = document.getElementById("mape");
+
+  function seg(id, key) {
+    var box = document.getElementById(id);
+    box.addEventListener("click", function (ev) {
+      var btn = ev.target.closest("button[data-v]");
+      if (!btn) return;
+      state[key] = btn.dataset.v;
+      renderGate();
+    });
+    return box;
+  }
+  var tierSeg = seg("tierSeg", "tier");
+  var dirSeg = seg("dirSeg", "direction");
+
+  function paintSeg(box, val) {
+    Array.prototype.forEach.call(box.querySelectorAll("button"), function (b) {
+      b.setAttribute("aria-pressed", String(b.dataset.v === val));
+    });
+  }
+
+  function renderGate() {
+    state.move = parseFloat(moveEl.value);
+    state.mape = parseFloat(mapeEl.value);
+    document.getElementById("moveOut").textContent = pct1(state.move);
+    document.getElementById("mapeOut").textContent = pct1(state.mape);
+    paintSeg(tierSeg, state.tier);
+    paintSeg(dirSeg, state.direction);
+
+    var res = forecastMultiplier(state, USD.net);
+    var mult = res[0], why = res[1];
+    var ratio = parseFloat(ratioEl.value);
+    var eff = ratio * mult;
+    var amt = recommended(USD, ratio, mult);
+
+    var v = document.getElementById("verdict");
+    v.className = "verdict " + (mult < 1 ? "cut" : "hold");
+    document.getElementById("multOut").textContent = mult.toFixed(2) + "×";
+    document.getElementById("whyOut").innerHTML =
+      "<b>" + (mult < 1 ? "允许降低套保" : "不降，按目标比例足额锁") + "</b><br />" + why;
+
+    document.getElementById("tgtCell").textContent = pct0(ratio);
+    document.getElementById("multCell").textContent = mult.toFixed(2) + "×";
+    document.getElementById("effCell").textContent = pctTrim(eff);
+    document.getElementById("amtCell").textContent = money(amt);
+
+    var unfavorable = USD.net > 0 ? state.direction === "down" : state.direction === "up";
+    var qualityFired = state.tier !== "support" && state.tier !== "caution";
+    var snrFired = !qualityFired && !unfavorable && state.move <= state.mape;
+    var gates = [
+      [qualityFired, "档位闸门", "模型回测质量未达 support / caution，预测方向整体不采信。"],
+      [!qualityFired && unfavorable, "方向闸门", "预测对当前敞口不利——不利一律足额锁，这条永不放松。"],
+      [snrFired, "信噪比闸门", "预测幅度 " + pct1(state.move) + " ≤ 模型误差 " + pct1(state.mape) +
+        "，方向判断落在噪声里。"],
+      [false, "只降不升不变量", "折扣取值域 {1.00, 0.70, 0.50}，没有任何 >1 的分支。"]
+    ];
+    document.getElementById("gateList").innerHTML = gates.map(function (g) {
+      return "<li class='" + (g[0] ? "fired" : "pass") + "'><span class='mark'>" +
+        (g[0] ? "✕" : "·") + "</span><span><b>" + g[1] + "</b> — " + g[2] + "</span></li>";
+    }).join("");
+  }
+
+  ratioEl.addEventListener("input", function () { renderDeck(); renderGate(); });
+  moveEl.addEventListener("input", renderGate);
+  mapeEl.addEventListener("input", renderGate);
+  renderDeck();
+  renderGate();
+})();
+</script>
+</body>
+</html>
