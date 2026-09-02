@@ -128,6 +128,7 @@ def benchmark_row(
     actual_rate: float,
     average_rate: float | None,
     average_source: str | None,
+    actual_notional: float | None = None,
 ) -> dict | None:
     """把一个（期间 × 币种）的实际结果折算成结汇均价，再和月均比。
 
@@ -136,12 +137,16 @@ def benchmark_row(
     差额对收汇方是"多收的人民币"，对付汇方是"少付的人民币"，
     所以按敞口方向定符号，正数一律表示比基准好。
     """
-    notional = abs(gross_signed)
+    # 结汇均价要按**实际结算的量**算。原来一律按计划敞口算并在计划量上截断，
+    # 实际收到 2000 而计划只有 1000 时，多出来的 1000 就按到期即期价被忽略了，
+    # 均价算错、价差跟着错，超额套保也会被低估。
+    notional = abs(gross_signed) if actual_notional is None else abs(actual_notional)
     if notional <= 0 or not average_rate:
         return None
 
     hedged_notional = 0.0
     hedged_value = 0.0
+    offsetting_total = 0.0
     # 锁汇总量超过敞口时要截断，那就必须定死"先用哪一笔"。
     # 原来按记录插入顺序截断，两笔价格不同的锁汇换个录入次序，
     # 结汇均价就变了——同样的经济头寸给出不同的绩效。按交易日先进先出。
@@ -153,6 +158,8 @@ def benchmark_row(
         rate = float(hedge.get("locked_rate", 0) or 0)
         if amount <= 0 or rate <= 0:
             continue
+        # 未截断的对冲总量：算超额套保要用它，用截断后的值永远算不出超额
+        offsetting_total += amount
         # 锁得比敞口多的部分不算进结汇均价——那是超额套保，不是这笔业务的成本
         usable = min(amount, notional - hedged_notional)
         if usable <= 0:
@@ -174,6 +181,7 @@ def benchmark_row(
         "currency": currency,
         "notional": notional,
         "hedged_notional": hedged_notional,
+        "offsetting_total": offsetting_total,
         "hedge_coverage": hedged_notional / notional if notional else 0.0,
         "realized_avg_rate": realized_avg,
         "actual_rate": actual_rate,

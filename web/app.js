@@ -764,6 +764,12 @@ function renderPlanDrift(drift) {
     parts.push(`<p class="meta">只影响损益模拟、不影响建议金额的改动：${scenario.map(([key]) =>
       escapeHtml(DECISION_LABELS[key] || key)).join("、")}</p>`);
   }
+  const signals = Object.entries(drift.signal_changed || {});
+  if (signals.length) {
+    parts.push(`<p><b>预测信号已变（折扣会跟着变）：</b>${signals.map(([currency, change]) =>
+      `${escapeHtml(currency)} ${escapeHtml(auditValue(change.from))} → ${escapeHtml(auditValue(change.to))}`
+    ).join("；")}</p>`);
+  }
   if (rates.length) {
     parts.push(`<p class="meta">汇率相对快照的变动：${rates.map(([currency, move]) =>
       `${escapeHtml(currency)} ${(move.move * 100).toFixed(2)}%`).join("、")}</p>`);

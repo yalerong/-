@@ -19,8 +19,10 @@ DECISION_KEYS = (
     "month_currency_hedge_ratios",
     "interest_rates",
     "forward_overrides",
-    "strategy_type",
 )
+# `strategy_type` 曾经在上面这张表里，但全仓没有任何计算读它，
+# 改它会误报"建议已变"，与这张表的定义自相矛盾，所以移出去。
+# 哪天它真的接进建议计算，再加回来。
 
 # 影响情景损益、但不影响建议金额的项，单独归一类
 SCENARIO_KEYS = (
@@ -55,6 +57,9 @@ def freeze(dashboard: dict, label: str | None, now_iso: str) -> dict:
                 "trade_rate": item.get("trade_rate"),
                 "forward_basis": item.get("forward_basis"),
                 "accounting_bucket": item.get("accounting_bucket"),
+                # 折扣是从这个信号算出来的。只存折扣不存信号的话，
+                # 事后既说不清当初模型是什么状态，也没法判断信号变没变。
+                "forecast_signal": _signal_fingerprint(item.get("forecast_signal")),
             }
         )
 
@@ -80,13 +85,29 @@ def freeze(dashboard: dict, label: str | None, now_iso: str) -> dict:
     }
 
 
+# 信号里只有这几项会改变折扣，存指纹而不是整个对象——
+# forecast 数组每月都变，拿它比会天天报"漂移"。
+SIGNAL_KEYS = ("tier", "direction", "mape", "n_test", "direction_accuracy")
+
+
+def _signal_fingerprint(signal: dict | None) -> dict | None:
+    if not signal:
+        return None
+    return {key: signal.get(key) for key in SIGNAL_KEYS}
+
+
 def _diff_value(before, after) -> dict | None:
     if before == after:
         return None
     return {"from": before, "to": after}
 
 
-def drift(plan: dict | None, config: dict, pair_rates: dict) -> dict:
+def drift(
+    plan: dict | None,
+    config: dict,
+    pair_rates: dict,
+    forecast_signals: dict | None = None,
+) -> dict:
     """当前配置相对最近一份方案漂了什么。
 
     分三类报：影响建议金额的、只影响情景的、汇率变动。
@@ -107,6 +128,19 @@ def drift(plan: dict | None, config: dict, pair_rates: dict) -> dict:
         if change:
             scenario[key] = change
 
+    # 预测信号变了，折扣就会变，建议金额跟着变——即使配置一个字没动。
+    signal_changed = {}
+    signals = forecast_signals or {}
+    for row in plan.get("rows", []):
+        currency = row.get("currency")
+        if currency in signal_changed:
+            continue
+        before = row.get("forecast_signal")
+        after = _signal_fingerprint(signals.get(currency))
+        change = _diff_value(before, after)
+        if change:
+            signal_changed[currency] = change
+
     frozen_rates = (plan.get("rate_snapshot") or {}).get("pair_rates") or {}
     rate_moves = {}
     for currency, old in frozen_rates.items():
@@ -123,6 +157,7 @@ def drift(plan: dict | None, config: dict, pair_rates: dict) -> dict:
         "created_at": plan.get("created_at"),
         "decision_changed": decision,
         "scenario_changed": scenario,
+        "signal_changed": signal_changed,
         "rate_moved": rate_moves,
-        "stale": bool(decision),
+        "stale": bool(decision) or bool(signal_changed),
     }

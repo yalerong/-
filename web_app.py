@@ -657,7 +657,7 @@ def build_dashboard(
     portfolio = build_portfolio(net_rows, suggestions)
     plan_list = state.get("plans", [])
     latest_plan = plan_list[-1] if plan_list else None
-    plan_drift = plans.drift(latest_plan, config, pair_rates)
+    plan_drift = plans.drift(latest_plan, config, pair_rates, forecast_signals)
     return {
         "config": config,
         "rates": rates_cache,
@@ -828,9 +828,16 @@ def build_backtest(
     pair_rates: dict[str, float],
     state: dict | None = None,
 ) -> list[dict]:
+    # 同一个期间/币种可能录了多条结算记录。以前汇率取最后一条、实际发生额
+    # 取"最后一条填了金额的"，两个数可能来自不同记录，拼出来的分解没有意义。
+    # 先选定唯一一条（最后录入的那条），汇率和金额都从它上面取。
+    settlement_by_key: dict[tuple[str, str], dict] = {}
+    for row in settlements:
+        key = (period_from_date(row.get("due_date", "")), row.get("currency", "").upper())
+        settlement_by_key[key] = row
+
     actual_by_key = {
-        (period_from_date(row.get("due_date", "")), row.get("currency", "").upper()): float(row.get("actual_rate", 0))
-        for row in settlements
+        key: float(row.get("actual_rate", 0)) for key, row in settlement_by_key.items()
     }
     # 计划敞口在这里要用**名义金额**，不能用概率加权后的值。
     # signed_exposure 是 amount × probability（套保规模按期望值定是对的），
@@ -843,8 +850,8 @@ def build_backtest(
         nominal_by_key[key] += abs(float(row.get("amount", 0) or 0))
 
     actual_amount_by_key = {
-        (period_from_date(row.get("due_date", "")), row.get("currency", "").upper()): float(row["actual_amount"])
-        for row in settlements
+        key: float(row["actual_amount"])
+        for key, row in settlement_by_key.items()
         if row.get("actual_amount") is not None
     }
     exposure_totals = aggregate_rows(exposures, signed_exposure)
@@ -881,17 +888,19 @@ def build_backtest(
         # 司库口径：结汇均价 vs 当月月均汇率。和上面那个"锁汇贡献"不是一回事——
         # 那个比的是到期即期价（交易员视角），这个比的是财务记账用的月均（司库视角）。
         average_rate, average_source = benchmarks.monthly_average(state or {}, period, currency)
+        actual_notional = actual_amount_by_key.get(key)
         benchmark = benchmarks.benchmark_row(
-            period, currency, gross, locked_by_key.get(key, []), actual_rate, average_rate, average_source
+            period, currency, gross, locked_by_key.get(key, []), actual_rate,
+            average_rate, average_source, actual_notional=actual_notional,
         )
         variance_row = None
         if benchmark:
             variance_row = variance.decompose(
                 planned_notional=nominal_by_key.get(key, benchmark["notional"]),
-                actual_notional=actual_amount_by_key.get(key),
+                actual_notional=actual_notional,
                 realized_avg_rate=benchmark["realized_avg_rate"],
                 benchmark_rate=benchmark["average_rate"],
-                hedged_notional=benchmark["hedged_notional"],
+                hedged_notional=benchmark["offsetting_total"],
                 gross_signed=gross,
             )
             if variance_row:
@@ -915,6 +924,7 @@ def build_backtest(
                 "settled": settled,
                 "notional": f2(benchmark["notional"]),
                 "hedged_notional": f2(benchmark["hedged_notional"]),
+                "offsetting_total": f2(benchmark["offsetting_total"]),
                 "hedge_coverage": fN(benchmark["hedge_coverage"], 4),
                 "realized_avg_rate": fN(benchmark["realized_avg_rate"], 6),
                 "average_rate": fN(benchmark["average_rate"], 6),
@@ -1102,10 +1112,13 @@ class FxRiskHandler(BaseHTTPRequestHandler):
                     return
                 if self.path == "/api/reset-demo":
                     before_reset = state
-                    save_state(DEMO_STATE)
+                    # 方案是只读存档，"恢复样例"的语义是重置工作数据，
+                    # 不该连历史快照一起抹掉——那是不可逆的，确认框也没提。
+                    reset_state = {**DEMO_STATE, "plans": state.get("plans", [])}
+                    save_state(reset_state)
                     # 先写盘再记日志：反过来的话，写盘失败会在只追加的历史里
                     # 永久留下一条"重置过"的假记录。
-                    append_audit("reset", "workspace", None, before_reset, DEMO_STATE)
+                    append_audit("reset", "workspace", None, before_reset, reset_state)
                     self.send_json({"ok": True})
                     return
         except (ValueError, KeyError, json.JSONDecodeError) as exc:

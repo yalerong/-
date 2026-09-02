@@ -5,6 +5,7 @@ import copy
 import unittest
 from datetime import date
 
+import benchmarks
 import plans
 import variance
 import web_app
@@ -70,6 +71,47 @@ class PlanSnapshotTest(unittest.TestCase):
         plan = plans.freeze(dashboard(self.state), None, "2026-05-12T00:00:00Z")
         result = plans.drift(plan, dict(web_app.DEFAULT_CONFIG), {"USD": 7.2036, "EUR": 7.8})
         self.assertEqual(result["rate_moved"], {})
+
+    def test_signal_change_alone_makes_the_plan_stale(self):
+        """配置一个字没动，但预测信号变了，折扣就变了，建议金额跟着变。"""
+        signals = {"USD": {"tier": "support", "direction": "up", "mape": 0.018,
+                           "n_test": 30, "direction_accuracy": 0.62}}
+        # 清掉已锁：support 档 + 方向有利会把比例打到 0.5×，
+        # 留着样例里那 50 万锁汇的话建议金额会归零、方案里就没有 USD 这行了
+        self.state["hedges"] = []
+        data = web_app.build_dashboard(
+            self.state, RATES, forecast_doc={"signals": signals}
+        )
+        plan = plans.freeze(data, None, "2026-05-12T00:00:00Z")
+        usd = next(r for r in plan["rows"] if r["currency"] == "USD")
+        self.assertEqual(usd["forecast_signal"]["tier"], "support")
+
+        # 同一份配置，信号降档
+        worse = {"USD": dict(signals["USD"], tier="reject")}
+        result = plans.drift(plan, data["config"], RATES["pair_rates"], worse)
+        self.assertTrue(result["stale"])
+        self.assertEqual(result["signal_changed"]["USD"]["to"]["tier"], "reject")
+        self.assertEqual(result["decision_changed"], {})
+
+    def test_unchanged_signal_is_not_drift(self):
+        signals = {"USD": {"tier": "support", "direction": "up", "mape": 0.018,
+                           "n_test": 30, "direction_accuracy": 0.62}}
+        self.state["hedges"] = []
+        data = web_app.build_dashboard(
+            self.state, RATES, forecast_doc={"signals": signals}
+        )
+        plan = plans.freeze(data, None, "2026-05-12T00:00:00Z")
+        result = plans.drift(plan, data["config"], RATES["pair_rates"], signals)
+        self.assertEqual(result["signal_changed"], {})
+        self.assertFalse(result["stale"])
+
+    def test_unused_strategy_type_is_not_decision_drift(self):
+        """strategy_type 全仓没有任何计算读它，改它不该误报"建议已变"。"""
+        self.assertNotIn("strategy_type", plans.DECISION_KEYS)
+        plan = plans.freeze(dashboard(self.state), None, "2026-05-12T00:00:00Z")
+        config = dict(web_app.DEFAULT_CONFIG, strategy_type="aggressive")
+        result = plans.drift(plan, config, RATES["pair_rates"])
+        self.assertFalse(result["stale"])
 
     def test_no_plan_yet(self):
         self.assertEqual(plans.drift(None, {}, {}), {"has_plan": False})
@@ -171,6 +213,69 @@ class VarianceNominalTest(unittest.TestCase):
         self.assertEqual(var["planned_notional"], 1000000)
         self.assertEqual(var["volume_gap"], 0)
         self.assertEqual(var["volume_variance_cny"], 0)
+
+
+class RealizedOnActualTest(unittest.TestCase):
+    def test_realized_average_follows_the_actual_amount(self):
+        """实际收到的比计划多时，多出来那部分按到期即期结，均价要跟着变。
+
+        原来一律按计划量算并在计划量上截断：计划 1000、锁 500@6、
+        实际收到 2000、即期 8，真实均价是 (500×6 + 1500×8)/2000 = 7.5，
+        而旧算法给 7.0，对着基准 7.0 报出"价差为零"。
+        """
+        row = benchmarks.benchmark_row(
+            "2026-06", "USD", gross_signed=1000.0,
+            hedges=[{"amount": 500, "locked_rate": 6.0, "action": "sell_foreign",
+                     "trade_date": "2026-05-01"}],
+            actual_rate=8.0, average_rate=7.0, average_source="test",
+            actual_notional=2000.0,
+        )
+        self.assertAlmostEqual(row["realized_avg_rate"], 7.5, places=10)
+        self.assertAlmostEqual(row["notional"], 2000.0, places=6)
+        self.assertAlmostEqual(row["hedge_coverage"], 0.25, places=6)
+
+    def test_over_hedging_uses_the_uncapped_total(self):
+        """超额要用未截断的对冲总量算，用截断后的值永远算不出超额。"""
+        row = benchmarks.benchmark_row(
+            "2026-06", "USD", gross_signed=1000.0,
+            hedges=[{"amount": 900, "locked_rate": 7.2, "action": "sell_foreign",
+                     "trade_date": "2026-05-01"}],
+            actual_rate=7.0, average_rate=7.1, average_source="test",
+            actual_notional=400.0,
+        )
+        self.assertAlmostEqual(row["offsetting_total"], 900.0, places=6)
+        self.assertAlmostEqual(row["hedged_notional"], 400.0, places=6)
+
+        var = variance.decompose(
+            planned_notional=1000, actual_notional=400,
+            realized_avg_rate=row["realized_avg_rate"], benchmark_rate=7.1,
+            hedged_notional=row["offsetting_total"], gross_signed=1000,
+        )
+        # 只收到 400 却锁了 900，有 500 是裸空头
+        self.assertTrue(var["over_hedged"])
+        self.assertAlmostEqual(var["over_hedged_notional"], 500.0, places=6)
+
+
+class SettlementPairingTest(unittest.TestCase):
+    def test_rate_and_amount_come_from_the_same_record(self):
+        """一个期间录了多条结算记录时，汇率和金额必须取自同一条。"""
+        state = copy.deepcopy(web_app.DEMO_STATE)
+        state["monthly_average_rates"] = {"2026-06:USD": 7.15}
+        state["settlements"] = [
+            {"id": "s1", "due_date": "2026-06-30", "currency": "USD",
+             "actual_rate": 7.0, "actual_amount": 900000},
+            # 后录的这条只填了汇率。旧实现会用这条的汇率 + 上一条的金额。
+            {"id": "s2", "due_date": "2026-06-30", "currency": "USD", "actual_rate": 7.3},
+        ]
+        row = next(r for r in dashboard(state)["backtest"] if r["currency"] == "USD")
+        self.assertEqual(row["actual_rate"], 7.3)
+        self.assertIsNone(row["benchmark"]["variance"], "最后那条没填金额，就不该有量差")
+
+
+class ResetKeepsPlansTest(unittest.TestCase):
+    def test_demo_state_has_no_plans_key(self):
+        # 恢复样例直接写 DEMO_STATE 的话，已冻结的方案会被不可逆地抹掉
+        self.assertNotIn("plans", web_app.DEMO_STATE)
 
 
 class NaturalOffsetScopeTest(unittest.TestCase):
