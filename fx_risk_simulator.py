@@ -386,7 +386,7 @@ def explain_report(report: dict[str, Any]) -> str:
             lines.append(f"- {issue.get('level', '')}: {issue.get('message', '')}")
     lines.append("")
 
-    lines.append("对应酷滴页面的五块产品逻辑：")
+    lines.append("整个流程分五块：")
     lines.append("- 风险识别：找出外币敞口在哪里。")
     lines.append("- 风险测量：把汇率变化换算成人民币损益。")
     lines.append("- 风险管理：比较不同套保比例和最坏情景。")

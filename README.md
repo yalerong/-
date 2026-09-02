@@ -43,7 +43,7 @@
 先打开 PowerShell，然后进入项目目录：
 
 ```powershell
-cd <你放这个项目的目录>\fx_patent_reconstruction
+cd FX-Hedge-Lab
 ```
 
 启动本地网页服务：
