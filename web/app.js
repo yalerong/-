@@ -65,7 +65,7 @@ function renderDashboard(data) {
   renderNetExposure(data.net_exposures || []);
   renderList("exposureRows", data.exposures || [], renderExposure);
   renderList("hedgeRows", data.hedges || [], renderHedge);
-  renderScenarioRows(data.scenario_rows || []);
+  renderScenarioRows(data.scenario_rows || [], data.scenario_totals || {});
   renderList("backtestRows", data.backtest || [], renderBacktest);
   renderConfig(data.config || {});
 }
@@ -217,13 +217,54 @@ function renderNetExposure(rows) {
   });
 }
 
-function renderScenarioRows(entries) {
+function renderScenarioTotals(totals, legCount) {
+  const names = ["neutral", "optimistic", "pessimistic", "custom"].filter((n) => totals[n]);
+  if (!names.length) return "";
+  const rows = names.map((name) => {
+    const row = totals[name];
+    return `
+      <tr>
+        <td>${scenarioName(name)}</td>
+        <td>${money(row.unrealized_exchange_gain_loss)}</td>
+        <td>${money(row.hedge_pnl)}</td>
+        <td class="total-cell">${money(row.total_projected_gain_loss)}</td>
+      </tr>
+    `;
+  }).join("");
+  const best = totals.optimistic && totals.pessimistic
+    ? Math.abs(totals.optimistic.total_projected_gain_loss - totals.pessimistic.total_projected_gain_loss)
+    : null;
+  const spread = best === null ? "" : `乐观与悲观两端相差 ${money(best)} CNY。`;
+  return `
+    <div class="item total-item">
+      <strong>全部敞口合计（${legCount} 组期间 × 币种）</strong>
+      <p class="meta">各币种损益已折成人民币，可直接相加；不同到期日按名义金额相加，未做贴现。${spread}</p>
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr>
+              <th>场景</th>
+              <th>未实现汇兑损益</th>
+              <th>套保损益</th>
+              <th>合计预计损益</th>
+            </tr>
+          </thead>
+          <tbody>${rows}</tbody>
+        </table>
+      </div>
+    </div>
+  `;
+}
+
+function renderScenarioRows(entries, totals) {
   const box = document.getElementById("scenarioRows");
   box.innerHTML = "";
   if (!entries.length) {
     box.innerHTML = '<div class="item">暂无敞口，因此没有预计损益场景。</div>';
     return;
   }
+  // 先给组合层面的总账，再给逐个期间/币种的明细。
+  box.insertAdjacentHTML("beforeend", renderScenarioTotals(totals || {}, entries.length));
   entries.forEach((item) => {
     const rows = Object.entries(item.projection || {}).map(([name, row]) => {
       const bucketValue = row[item.accounting_bucket] || 0;

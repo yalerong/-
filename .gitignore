@@ -4,3 +4,6 @@ data/tmp/
 data/fx_workspace.json
 data/rates_cache.json
 data/events/events.csv
+
+# wrangler 本地部署缓存（含账号信息，不进仓库）
+.wrangler/

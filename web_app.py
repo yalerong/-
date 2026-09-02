@@ -482,6 +482,7 @@ def build_dashboard(state: dict, rates_cache: dict, forecast_doc: dict | None = 
             suggestions.append(recommendation)
 
     backtest_rows = build_backtest(exposures, hedges, settlements, pair_rates)
+    scenario_totals = aggregate_scenarios(scenario_rows, scenario_rates)
     return {
         "config": config,
         "rates": rates_cache,
@@ -492,10 +493,13 @@ def build_dashboard(state: dict, rates_cache: dict, forecast_doc: dict | None = 
         "suggestions": suggestions,
         "scenario_rates": scenario_rates,
         "scenario_rows": scenario_rows,
+        "scenario_totals": scenario_totals,
         "scenario_summary": scenario_summary,
         "backtest": backtest_rows,
         "forecast": forecast_doc,
-        "plain_language": build_plain_language(net_rows, suggestions, backtest_rows, rates_cache),
+        "plain_language": build_plain_language(
+            net_rows, suggestions, backtest_rows, rates_cache, scenario_totals
+        ),
     }
 
 
@@ -507,6 +511,38 @@ def suggestion_text(currency: str, net: float, ratio: float, amount: float, acti
         exposure_side = f"未来净付 {currency}"
         action_text = "买入外币/远期购汇"
     return f"{exposure_side}，建议先锁 {ratio:.0%}，即 {amount:,.2f} {currency}，操作方向：{action_text}。"
+
+
+def aggregate_scenarios(
+    scenario_rows: list[dict], scenario_rates: dict[str, dict[str, float]]
+) -> dict[str, dict]:
+    """把逐个（期间 × 币种）的情景损益汇总成组合层面的一张表。
+
+    各币种的损益本来就已经折成人民币（金额 × 汇率变动），可以直接相加。
+    不同到期日的金额也直接相加，不做贴现——这是名义口径，不是现值。
+    """
+    totals: dict[str, dict] = {}
+    for name in scenario_rates:
+        bucket_totals: dict[str, float] = defaultdict(float)
+        exposure_pnl = 0.0
+        hedge_pnl = 0.0
+        for entry in scenario_rows:
+            row = entry["projection"].get(name)
+            if not row:
+                continue
+            bucket = entry["accounting_bucket"]
+            leg = float(row.get(bucket, 0.0))
+            exposure_pnl += float(row.get("unrealized_exchange_gain_loss", 0.0))
+            hedge_pnl += leg
+            bucket_totals[bucket] += leg
+        totals[name] = {
+            "unrealized_exchange_gain_loss": round(exposure_pnl, 2),
+            "hedge_pnl": round(hedge_pnl, 2),
+            "total_projected_gain_loss": round(exposure_pnl + hedge_pnl, 2),
+            "by_bucket": {key: round(value, 2) for key, value in sorted(bucket_totals.items())},
+            "leg_count": len(scenario_rows),
+        }
+    return totals
 
 
 def build_backtest(exposures: list[dict], hedges: list[dict], settlements: list[dict], pair_rates: dict[str, float]) -> list[dict]:
@@ -568,7 +604,13 @@ def build_backtest(exposures: list[dict], hedges: list[dict], settlements: list[
     return rows
 
 
-def build_plain_language(net_rows: list[dict], suggestions: list[dict], backtest_rows: list[dict], rates_cache: dict) -> list[str]:
+def build_plain_language(
+    net_rows: list[dict],
+    suggestions: list[dict],
+    backtest_rows: list[dict],
+    rates_cache: dict,
+    scenario_totals: dict[str, dict] | None = None,
+) -> list[str]:
     lines = [
         "这套本地工具按五步跑：先录入外币收付款，再汇总净敞口，再给锁汇建议，再记录实际锁汇，最后用实际汇率回头检查收益。",
         f"当前汇率来源：{rates_cache.get('source')}；状态：{rates_cache.get('status')}；更新时间：{rates_cache.get('fetched_at')}。",
@@ -583,6 +625,14 @@ def build_plain_language(net_rows: list[dict], suggestions: list[dict], backtest
         )
     for item in suggestions:
         lines.append(item["plain_text"])
+    worst = scenario_totals.get("pessimistic") if scenario_totals else None
+    best = scenario_totals.get("optimistic") if scenario_totals else None
+    if worst and best:
+        lines.append(
+            f"把所有敞口和建议锁汇合在一起看：悲观场景合计 {worst['total_projected_gain_loss']:,.2f} CNY，"
+            f"乐观场景合计 {best['total_projected_gain_loss']:,.2f} CNY，两端相差 "
+            f"{abs(best['total_projected_gain_loss'] - worst['total_projected_gain_loss']):,.2f} CNY。"
+        )
     if backtest_rows:
         lines.append("回测不是预测，它只是回答：如果按已记录锁汇执行，到期后相对实际汇率贡献了多少人民币。")
         pending = [row for row in backtest_rows if not row.get("settled")]

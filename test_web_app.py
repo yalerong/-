@@ -96,6 +96,41 @@ class WebAppLogicTest(unittest.TestCase):
             any("还没录入到期实际汇率" in line for line in dashboard["plain_language"])
         )
 
+    def test_scenario_totals_sum_every_currency_and_period(self):
+        dashboard = web_app.build_dashboard(web_app.DEMO_STATE, self.rates, forecast_doc={})
+        totals = dashboard["scenario_totals"]
+        rows = dashboard["scenario_rows"]
+
+        self.assertEqual(set(totals), {"neutral", "optimistic", "pessimistic", "custom"})
+        self.assertEqual(totals["neutral"]["total_projected_gain_loss"], 0)
+
+        for name in totals:
+            expected_exposure = sum(
+                row["projection"][name]["unrealized_exchange_gain_loss"] for row in rows
+            )
+            expected_hedge = sum(
+                row["projection"][name][row["accounting_bucket"]] for row in rows
+            )
+            self.assertAlmostEqual(
+                totals[name]["unrealized_exchange_gain_loss"], round(expected_exposure, 2), places=2
+            )
+            self.assertAlmostEqual(totals[name]["hedge_pnl"], round(expected_hedge, 2), places=2)
+            self.assertAlmostEqual(
+                totals[name]["total_projected_gain_loss"],
+                round(expected_exposure + expected_hedge, 2),
+                places=2,
+            )
+            self.assertEqual(
+                sum(totals[name]["by_bucket"].values()), totals[name]["hedge_pnl"]
+            )
+
+        # 乐观与悲观对称，合计应互为相反数
+        self.assertAlmostEqual(
+            totals["optimistic"]["total_projected_gain_loss"],
+            -totals["pessimistic"]["total_projected_gain_loss"],
+            places=2,
+        )
+
     def test_pair_rates_from_open_endpoint_payload(self):
         payload = {"rates": {"USD": 1, "CNY": 7.2, "EUR": 0.9}}
         rates = web_app.pair_rates_from_payload(payload, ["USD", "EUR"])

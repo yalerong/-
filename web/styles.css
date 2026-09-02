@@ -340,3 +340,12 @@ th {
     margin-top: 12px;
   }
 }
+
+.total-item {
+  border-left: 3px solid #0f766e;
+  background: #f3faf8;
+}
+
+.total-item .total-cell {
+  font-weight: 600;
+}
