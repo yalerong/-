@@ -1,5 +1,6 @@
 import copy
 import unittest
+from datetime import date
 
 import web_app
 
@@ -102,6 +103,9 @@ class WebAppLogicTest(unittest.TestCase):
         rows = dashboard["scenario_rows"]
 
         self.assertEqual(set(totals), {"neutral", "optimistic", "pessimistic", "custom"})
+        # DEMO_STATE 的期间都在过去，远期退回即期，所以中性场景恰好是 0。
+        # 这条以前写成无条件断言，其实是靠"跑测试的那天已经过了 2026-06"才成立的，
+        # 而且和 README 里"中性不再恒等于 0"自相矛盾。见下面那条未来期间的测试。
         self.assertEqual(totals["neutral"]["total_projected_gain_loss"], 0)
 
         for name in totals:
@@ -176,6 +180,106 @@ class WebAppLogicTest(unittest.TestCase):
         self.assertIn("ZZZ", portfolio["rate_missing"])
         zzz = next(row for row in portfolio["by_currency"] if row["currency"] == "ZZZ")
         self.assertEqual(zzz["gross_cny"], 0)
+
+    def test_neutral_scenario_is_not_zero_once_there_are_forward_points(self):
+        """远期贴水本身就是成本，中性场景不该恒等于 0。
+
+        以前整条远期路径在 build_dashboard 这一层没有测试覆盖——因为样例数据
+        的期间全在过去，永远走即期兜底。这里显式给一个未来期间和一个固定的今天。
+        """
+        state = copy.deepcopy(web_app.DEMO_STATE)
+        state["config"] = dict(
+            web_app.DEFAULT_CONFIG,
+            interest_rates={"CNY": 0.02, "USD": 0.05, "EUR": 0.025},
+        )
+        state["exposures"] = [{
+            "id": "e-future", "due_date": "2027-06-30", "currency": "USD",
+            "amount": 1000000, "direction": "receipt", "category": "order_contract",
+            "probability": 1,
+        }]
+        state["hedges"] = []
+        state["settlements"] = []
+
+        dashboard = web_app.build_dashboard(
+            state, self.rates, forecast_doc={}, today=date(2027, 1, 1)
+        )
+        sug = dashboard["suggestions"][0]
+        self.assertEqual(sug["forward_basis"], "cip")
+        # 美元利率高于人民币，出口商锁远期结汇要贴水
+        self.assertLess(sug["forward_rate"], sug["spot_rate"])
+        self.assertLess(sug["forward_points"], 0)
+
+        neutral = dashboard["scenario_totals"]["neutral"]["total_projected_gain_loss"]
+        self.assertNotEqual(neutral, 0)
+        self.assertLess(neutral, 0, "锁远期结汇的贴水是成本，中性场景应该是负的")
+
+        # 同一份数据，如果到期日已过就退回即期，中性场景回到 0
+        past = web_app.build_dashboard(
+            state, self.rates, forecast_doc={}, today=date(2028, 1, 1)
+        )
+        self.assertEqual(past["suggestions"][0]["forward_basis"], "spot")
+        self.assertEqual(past["scenario_totals"]["neutral"]["total_projected_gain_loss"], 0)
+
+    def test_portfolio_only_counts_hedges_that_actually_offset(self):
+        """方向相同的"锁汇"不是套保，是加仓，不能算进已锁。
+
+        以前直接取 abs(locked_exposure)，结果 已锁 + 剩余 ≠ 业务敞口、
+        剩余 > 业务敞口、覆盖率还显示 41.67%——而真实覆盖是 0。
+        """
+        state = copy.deepcopy(web_app.DEMO_STATE)
+        state["exposures"] = [{
+            "id": "e1", "due_date": "2026-06-30", "currency": "USD",
+            "amount": 1200000, "direction": "receipt", "category": "order_contract",
+            "probability": 1,
+        }]
+        # 收汇敞口却买入外币：方向反了
+        state["hedges"] = [{
+            "id": "h1", "trade_date": "2026-05-12", "due_date": "2026-06-30",
+            "currency": "USD", "amount": 500000, "action": "buy_foreign", "locked_rate": 7.18,
+        }]
+        portfolio = web_app.build_dashboard(state, self.rates, forecast_doc={})["portfolio"]
+
+        self.assertEqual(portfolio["locked_cny"], 0)
+        self.assertEqual(portfolio["locked_ratio"], 0)
+        self.assertAlmostEqual(
+            portfolio["locked_cny"] + portfolio["net_exposure_cny"],
+            portfolio["gross_exposure_cny"], places=2,
+            msg="已锁 + 剩余 必须等于 业务敞口",
+        )
+        self.assertLessEqual(portfolio["net_exposure_cny"], portfolio["gross_exposure_cny"])
+
+    def test_portfolio_totals_stay_additive_with_a_proper_hedge(self):
+        portfolio = web_app.build_dashboard(
+            web_app.DEMO_STATE, self.rates, forecast_doc={}
+        )["portfolio"]
+        self.assertAlmostEqual(
+            portfolio["locked_cny"] + portfolio["net_exposure_cny"],
+            portfolio["gross_exposure_cny"], places=2,
+        )
+
+    def test_zero_probability_is_rejected_not_silently_promoted(self):
+        """概率 0 以前被 `or 1` 悄悄换成 1，等于把已取消的订单按全额记进敞口。"""
+        for value in (0, 0.0, "0", -0.5, 1.5, "abc"):
+            with self.subTest(value=value):
+                with self.assertRaises(ValueError):
+                    web_app.validate_exposure({
+                        "due_date": "2026-09-30", "currency": "USD", "amount": 100,
+                        "direction": "receipt", "probability": value,
+                    })
+
+        # 不填或留空仍然默认 1
+        for value in (None, ""):
+            row = {"due_date": "2026-09-30", "currency": "USD", "amount": 100,
+                   "direction": "receipt", "probability": value}
+            web_app.validate_exposure(row)
+            self.assertEqual(row["probability"], 1.0)
+
+    def test_unsettled_benchmark_is_marked_provisional(self):
+        dashboard = web_app.build_dashboard(web_app.DEMO_STATE, self.rates, forecast_doc={})
+        for row in dashboard["backtest"]:
+            bench = row.get("benchmark")
+            if bench:
+                self.assertEqual(bench["settled"], row["settled"])
 
     def test_pair_rates_from_open_endpoint_payload(self):
         payload = {"rates": {"USD": 1, "CNY": 7.2, "EUR": 0.9}}

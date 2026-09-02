@@ -6,7 +6,7 @@ import mimetypes
 import threading
 import uuid
 from collections import defaultdict
-from datetime import datetime, timezone
+from datetime import date as dt_date, datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import urlparse
@@ -14,6 +14,8 @@ from urllib.error import URLError
 from urllib.request import Request, urlopen
 
 from money import D, f2, f as fN
+import benchmarks
+import forwards
 
 
 ROOT = Path(__file__).resolve().parent
@@ -43,6 +45,15 @@ DEFAULT_CONFIG = {
     "optimistic_shift_pct": 0.03,
     "pessimistic_shift_pct": -0.03,
     "custom_scenario_shift_pct": 0.01,
+    # 远期价：优先用 forward_overrides 里的银行报价，没有就按利差推。
+    # 这几个默认值只是让工具开箱能跑，**用之前请换成你自己的资金成本**。
+    "interest_rates": {"CNY": 0.019, "USD": 0.043, "EUR": 0.025, "JPY": 0.005,
+                       "HKD": 0.042, "GBP": 0.045, "AUD": 0.038, "SGD": 0.032},
+    "forward_overrides": {},
+    # 情景默认对所有币种同幅同向变动，等于假设币种间相关性为 1。
+    # 对"净收美元 + 净付欧元"这种组合会天然对冲、把风险算小，
+    # 要按币种分别设就写在这里：{"USD": {"optimistic": 0.03, ...}}
+    "scenario_shifts": {},
 }
 
 
@@ -390,17 +401,44 @@ def accounting_bucket(category: str, trade_date: str, due_date: str) -> str:
     return "fair_value_change_gain_loss"
 
 
-def scenario_rates_for(pair_rates: dict[str, float], config: dict) -> dict[str, dict[str, float]]:
-    shifts = {
+def scenario_shifts_for(config: dict) -> dict[str, float]:
+    return {
         "neutral": 0.0,
         "optimistic": float(config.get("optimistic_shift_pct", 0.03)),
         "pessimistic": float(config.get("pessimistic_shift_pct", -0.03)),
         "custom": float(config.get("custom_scenario_shift_pct", 0.01)),
     }
+
+
+def shift_for(config: dict, name: str, currency: str) -> float:
+    """某币种在某情景下的涨跌幅。没单独配就用全局值。"""
+    default = scenario_shifts_for(config)[name]
+    per_currency = (config.get("scenario_shifts") or {}).get(currency)
+    if isinstance(per_currency, dict) and per_currency.get(name) is not None:
+        try:
+            return float(per_currency[name])
+        except (TypeError, ValueError):
+            return default
+    return default
+
+
+def scenario_rates_for(pair_rates: dict[str, float], config: dict) -> dict[str, dict[str, float]]:
     return {
-        name: {currency: fN(float(rate) * (1 + shift), 6) for currency, rate in pair_rates.items()}
-        for name, shift in shifts.items()
+        name: {
+            currency: fN(float(rate) * (1 + shift_for(config, name, currency)), 6)
+            for currency, rate in pair_rates.items()
+        }
+        for name in scenario_shifts_for(config)
     }
+
+
+def scenario_is_uniform(config: dict, currencies: list[str]) -> bool:
+    """所有币种是不是同一套涨跌幅——是的话就等于假设相关性为 1，要在页面上说清楚。"""
+    for name in scenario_shifts_for(config):
+        values = {shift_for(config, name, currency) for currency in currencies}
+        if len(values) > 1:
+            return False
+    return True
 
 
 def signed_recommendation(action: str, amount: float) -> float:
@@ -436,7 +474,12 @@ def scenario_projection(
     return rows
 
 
-def build_dashboard(state: dict, rates_cache: dict, forecast_doc: dict | None = None) -> dict:
+def build_dashboard(
+    state: dict,
+    rates_cache: dict,
+    forecast_doc: dict | None = None,
+    today: dt_date | None = None,
+) -> dict:
     pair_rates = rates_cache.get("pair_rates", {})
     exposures = state.get("exposures", [])
     hedges = state.get("hedges", [])
@@ -465,12 +508,18 @@ def build_dashboard(state: dict, rates_cache: dict, forecast_doc: dict | None = 
         cny_risk = abs(net * rate)
         target_ratio = hedge_ratio_for(config, period, currency)
         category = exposure_category_for(exposures, period, currency)
+        # 远期结汇不是按即期价成交的，交易价要用远期价
+        fwd = forwards.forward_rate(rate, currency, period, config, today=today)
+        trade_rate = fN(fwd["rate"], 6)
+        # 到期日已过的敞口还留在建议里，说明它没被处理掉——不自动删，但要标出来
+        past_due = fwd["tenor_years"] <= 0
         net_rows.append(
             {
                 "period": period,
                 "currency": currency,
                 "risk_category": category,
                 "risk_category_known": known_category(category),
+                "past_due": past_due,
                 "target_hedge_ratio": target_ratio,
                 "business_exposure": f2(gross),
                 "locked_exposure": f2(hedged),
@@ -490,6 +539,7 @@ def build_dashboard(state: dict, rates_cache: dict, forecast_doc: dict | None = 
         recommended_amount = float(max(D(0), target_cover - covered))
         action = action_for(config, net)
         bucket = accounting_bucket(category, now_iso()[:10], f"{period}-28")
+        # 远期结汇不是按即期价成交的，交易价要用远期价
 
         # 情景损益对每一行净敞口都算：建议金额为 0 时套保腿为 0，
         # 但敞口本身的浮动损益依然存在，不能整块消失。
@@ -500,7 +550,7 @@ def build_dashboard(state: dict, rates_cache: dict, forecast_doc: dict | None = 
             {
                 "action": action,
                 "recommended_amount": recommended_amount,
-                "trade_rate": rate,
+                "trade_rate": trade_rate,
                 "accounting_bucket": bucket,
             },
             rate,
@@ -531,7 +581,14 @@ def build_dashboard(state: dict, rates_cache: dict, forecast_doc: dict | None = 
                 "business_exposure": f2(gross),
                 "covered_exposure": f2(covered),
                 "current_rate": rate,
-                "trade_rate": rate,
+                "trade_rate": trade_rate,
+                "spot_rate": rate,
+                "forward_rate": trade_rate,
+                "forward_points": fN(fwd["points"], 6),
+                "forward_basis": fwd["basis"],
+                "past_due": past_due,
+                "forward_note": fwd["note"],
+                "tenor_years": fN(fwd["tenor_years"], 4),
                 "risk_cny": f2(cny_risk),
                 "target_hedge_ratio": target_ratio,
                 "effective_hedge_ratio": fN(effective_ratio, 4),
@@ -546,7 +603,7 @@ def build_dashboard(state: dict, rates_cache: dict, forecast_doc: dict | None = 
             }
             suggestions.append(recommendation)
 
-    backtest_rows = build_backtest(exposures, hedges, settlements, pair_rates)
+    backtest_rows = build_backtest(exposures, hedges, settlements, pair_rates, state)
     scenario_totals = aggregate_scenarios(scenario_rows, scenario_rates)
     portfolio = build_portfolio(net_rows, suggestions)
     return {
@@ -559,6 +616,7 @@ def build_dashboard(state: dict, rates_cache: dict, forecast_doc: dict | None = 
         "portfolio": portfolio,
         "suggestions": suggestions,
         "scenario_rates": scenario_rates,
+        "scenario_uniform": scenario_is_uniform(config, sorted({row["currency"] for row in net_rows})),
         "scenario_rows": scenario_rows,
         "scenario_totals": scenario_totals,
         "scenario_summary": scenario_summary,
@@ -614,9 +672,17 @@ def build_portfolio(net_rows: list[dict], suggestions: list[dict]) -> dict:
                 missing_rate.append(currency)
             continue
         rate = float(row["current_rate"])
-        bucket["gross_cny"] += abs(float(row["business_exposure"])) * rate
-        bucket["locked_cny"] += abs(float(row["locked_exposure"])) * rate
-        bucket["net_cny"] += abs(float(row["net_exposure"])) * rate
+        gross = float(row["business_exposure"])
+        locked = float(row["locked_exposure"])
+        # 只有方向相反的锁汇才算"锁掉了"，而且最多锁到敞口本身那么多。
+        # 直接取 abs(locked) 的话，同向的锁汇（那不是套保，是加仓）会被算成覆盖，
+        # 结果是 已锁 + 剩余 ≠ 业务敞口、剩余 > 业务敞口、覆盖率虚高。
+        offset = 0.0
+        if gross * locked < 0:
+            offset = min(abs(locked), abs(gross))
+        bucket["gross_cny"] += abs(gross) * rate
+        bucket["locked_cny"] += offset * rate
+        bucket["net_cny"] += (abs(gross) - offset) * rate
         bucket["recommended_cny"] += recommended_by_key.get((row["period"], currency), 0.0) * rate
 
     rows = []
@@ -679,7 +745,13 @@ def aggregate_scenarios(
     return totals
 
 
-def build_backtest(exposures: list[dict], hedges: list[dict], settlements: list[dict], pair_rates: dict[str, float]) -> list[dict]:
+def build_backtest(
+    exposures: list[dict],
+    hedges: list[dict],
+    settlements: list[dict],
+    pair_rates: dict[str, float],
+    state: dict | None = None,
+) -> list[dict]:
     actual_by_key = {
         (period_from_date(row.get("due_date", "")), row.get("currency", "").upper()): float(row.get("actual_rate", 0))
         for row in settlements
@@ -715,10 +787,33 @@ def build_backtest(exposures: list[dict], hedges: list[dict], settlements: list[
                     "effect_cny": f2(effect),
                 }
             )
+        # 司库口径：结汇均价 vs 当月月均汇率。和上面那个"锁汇贡献"不是一回事——
+        # 那个比的是到期即期价（交易员视角），这个比的是财务记账用的月均（司库视角）。
+        average_rate, average_source = benchmarks.monthly_average(state or {}, period, currency)
+        benchmark = benchmarks.benchmark_row(
+            period, currency, gross, locked_by_key.get(key, []), actual_rate, average_rate, average_source
+        )
+        if benchmark:
+            benchmark = {
+                **benchmark,
+                # 未结算时 actual_rate 是拿当前市场价试算的，
+                # 由它推出来的结汇均价和归因同样是试算值，不能当结算结果读
+                "settled": settled,
+                "notional": f2(benchmark["notional"]),
+                "hedged_notional": f2(benchmark["hedged_notional"]),
+                "hedge_coverage": fN(benchmark["hedge_coverage"], 4),
+                "realized_avg_rate": fN(benchmark["realized_avg_rate"], 6),
+                "average_rate": fN(benchmark["average_rate"], 6),
+                "hedge_effect_cny": f2(benchmark["hedge_effect_cny"]),
+                "timing_effect_cny": f2(benchmark["timing_effect_cny"]),
+                "vs_benchmark_cny": f2(benchmark["vs_benchmark_cny"]),
+            }
+
         rows.append(
             {
                 "period": period,
                 "currency": currency,
+                "benchmark": benchmark,
                 "business_exposure": f2(gross),
                 "actual_rate": fN(actual_rate, 6),
                 "reference_rate": fN(market_rate, 6),
@@ -769,6 +864,14 @@ def build_plain_language(
         )
     if backtest_rows:
         lines.append("回测不是预测，它只是回答：如果按已记录锁汇执行，到期后相对实际汇率贡献了多少人民币。")
+        benched = [row for row in backtest_rows if row.get("benchmark")]
+        if benched:
+            total = sum(row["benchmark"]["vs_benchmark_cny"] for row in benched)
+            side = "好于" if total >= 0 else "差于"
+            lines.append(
+                f"按司库口径再看一遍：{len(benched)} 个期间的结汇均价合计{side}当月月均汇率 "
+                f"{abs(total):,.2f} CNY。这才是财务考核用的比法。"
+            )
         pending = [row for row in backtest_rows if not row.get("settled")]
         if pending:
             names = "、".join(f"{row['period']} {row['currency']}" for row in pending)
@@ -935,7 +1038,15 @@ def validate_exposure(row: dict) -> None:
             "exposure category must be one of " + "/".join(EXPOSURE_CATEGORIES) + f"; got {category!r}"
         )
     row["category"] = category
-    probability = float(row.get("probability", 1) or 1)
+    raw_probability = row.get("probability")
+    # 不能写成 `or 1`：0 是假值，会被悄悄换成 1，
+    # 等于把一笔已取消的订单按全额记进敞口，而校验根本不会触发。
+    if raw_probability is None or raw_probability == "":
+        raw_probability = 1
+    try:
+        probability = float(raw_probability)
+    except (TypeError, ValueError):
+        raise ValueError("probability must be a number in (0, 1]") from None
     if not 0 < probability <= 1:
         raise ValueError("probability must be in (0, 1]")
     row["probability"] = probability
