@@ -340,3 +340,230 @@ th {
     margin-top: 12px;
   }
 }
+
+.total-item {
+  border-left: 3px solid #0f766e;
+  background: #f3faf8;
+}
+
+.total-item .total-cell {
+  font-weight: 600;
+}
+
+/* ===== 两栏布局：左侧常驻导航 + 右侧内容 ===== */
+.layout {
+  max-width: 1420px;
+  margin: 0 auto;
+  display: grid;
+  grid-template-columns: 176px minmax(0, 1fr);
+  gap: 20px;
+  padding: 0 20px;
+  align-items: start;
+}
+
+.layout main {
+  max-width: none;
+  margin: 0;
+  padding-left: 0;
+  padding-right: 0;
+  min-width: 0;
+}
+
+.sidenav {
+  position: sticky;
+  top: 16px;
+  padding: 18px 0 24px;
+  display: flex;
+  flex-direction: column;
+  gap: 18px;
+}
+
+.nav-group {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.nav-title {
+  font-size: 11px;
+  letter-spacing: 0.12em;
+  color: var(--muted);
+  padding: 0 10px 6px;
+}
+
+.sidenav a {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 7px 10px;
+  border-radius: 6px;
+  color: var(--text);
+  text-decoration: none;
+  border-left: 2px solid transparent;
+}
+
+.sidenav a:hover {
+  background: #eef2f6;
+}
+
+.sidenav a.active {
+  background: #e7f2f0;
+  border-left-color: var(--accent);
+  color: var(--accent-dark);
+  font-weight: 600;
+}
+
+.nav-badge:empty {
+  display: none;
+}
+
+.nav-badge {
+  min-width: 18px;
+  padding: 0 5px;
+  border-radius: 9px;
+  background: var(--accent);
+  color: #fff;
+  font-size: 11px;
+  line-height: 18px;
+  text-align: center;
+}
+
+/* ===== 驾驶舱 KPI ===== */
+.kpi-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(190px, 1fr));
+  gap: 12px;
+}
+
+.kpi {
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  padding: 14px 16px;
+  background: #fbfcfd;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.kpi-label {
+  font-size: 12px;
+  color: var(--muted);
+}
+
+.kpi-value {
+  font-size: 20px;
+  font-weight: 700;
+  line-height: 1.2;
+}
+
+.kpi-note {
+  font-size: 12px;
+  color: var(--muted);
+}
+
+.kpi-warn {
+  background: #fdf6f4;
+  border-color: #f0d5cd;
+}
+
+.kpi-todo {
+  background: #f2f9f7;
+  border-color: #cfe6e0;
+}
+
+.bar {
+  display: inline-block;
+  width: 54px;
+  height: 6px;
+  border-radius: 3px;
+  background: #e5e9ef;
+  vertical-align: middle;
+  overflow: hidden;
+}
+
+.bar-fill {
+  display: block;
+  height: 100%;
+  background: var(--accent);
+}
+
+@media (max-width: 900px) {
+  .layout {
+    grid-template-columns: minmax(0, 1fr);
+    padding: 0 12px;
+  }
+
+  .sidenav {
+    position: static;
+    flex-direction: row;
+    gap: 10px;
+    overflow-x: auto;
+    padding: 12px 0 4px;
+  }
+
+  .nav-group {
+    flex-direction: row;
+    gap: 4px;
+  }
+
+  .nav-title {
+    display: none;
+  }
+
+  .sidenav a {
+    white-space: nowrap;
+    border-left: 0;
+    border-bottom: 2px solid transparent;
+  }
+
+  .sidenav a.active {
+    border-left: 0;
+    border-bottom-color: var(--accent);
+  }
+}
+
+/* ===== 明细表 ===== */
+#details .panel + .panel {
+  margin-top: 16px;
+}
+
+.detail-table td.num {
+  text-align: right;
+  font-variant-numeric: tabular-nums;
+}
+
+.detail-table th.col-action,
+.detail-table td.col-action {
+  width: 1%;
+  text-align: right;
+  white-space: nowrap;
+}
+
+.detail-table td.col-note {
+  color: var(--muted);
+  max-width: 260px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.detail-table .empty-row {
+  color: var(--muted);
+  text-align: center;
+  padding: 18px 0;
+}
+
+.row-delete {
+  padding: 3px 10px;
+  font-size: 12px;
+  background: transparent;
+  color: var(--danger);
+  border: 1px solid #e3c2bd;
+  border-radius: 5px;
+  cursor: pointer;
+}
+
+.row-delete:hover {
+  background: #fdf2f0;
+}

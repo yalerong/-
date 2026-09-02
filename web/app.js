@@ -61,11 +61,12 @@ async function loadDashboard() {
 
 function renderDashboard(data) {
   renderRateStatus(data);
+  renderPortfolio(data.portfolio || {});
   renderSuggestions(data.suggestions || []);
   renderNetExposure(data.net_exposures || []);
-  renderList("exposureRows", data.exposures || [], renderExposure);
-  renderList("hedgeRows", data.hedges || [], renderHedge);
-  renderScenarioRows(data.suggestions || []);
+  renderExposureTable(data.exposures || []);
+  renderHedgeTable(data.hedges || []);
+  renderScenarioRows(data.scenario_rows || [], data.scenario_totals || {});
   renderList("backtestRows", data.backtest || [], renderBacktest);
   renderConfig(data.config || {});
 }
@@ -83,6 +84,100 @@ function fmtTime(iso) {
   const d = new Date(iso);
   if (Number.isNaN(d.getTime())) return iso;
   return d.toLocaleString("zh-CN", { hour12: false });
+}
+
+function ratioBar(ratio) {
+  const pct = Math.max(0, Math.min(1, Number(ratio || 0))) * 100;
+  return `<span class="bar"><span class="bar-fill" style="width:${pct.toFixed(1)}%"></span></span>`;
+}
+
+function kpiCard(label, value, note, tone) {
+  return `
+    <div class="kpi${tone ? " kpi-" + tone : ""}">
+      <span class="kpi-label">${label}</span>
+      <strong class="kpi-value">${value}</strong>
+      <span class="kpi-note">${note || ""}</span>
+    </div>
+  `;
+}
+
+function renderPortfolio(portfolio) {
+  const box = document.getElementById("portfolioCards");
+  const scope = document.getElementById("portfolioScope");
+  const tbody = document.getElementById("portfolioByCurrency");
+  const note = document.getElementById("portfolioNote");
+  const badge = document.getElementById("todoCount");
+  if (!box) return;
+
+  const rows = portfolio.by_currency || [];
+  if (!rows.length) {
+    box.innerHTML = '<div class="kpi"><span class="kpi-label">暂无敞口</span><strong class="kpi-value">—</strong><span class="kpi-note">先在「录入」里添加一笔</span></div>';
+    tbody.innerHTML = "";
+    scope.textContent = "";
+    note.textContent = "";
+    if (badge) badge.textContent = "";
+    return;
+  }
+
+  scope.textContent = `${portfolio.currency_count} 个币种 · ${portfolio.period_count} 个期间 · ${portfolio.leg_count} 组敞口`;
+  box.innerHTML = [
+    kpiCard("业务敞口合计", money(portfolio.gross_exposure_cny) + " CNY", "各币种取绝对值后相加"),
+    kpiCard("已锁合计", money(portfolio.locked_cny) + " CNY", `已锁比例 ${ratioText(portfolio.locked_ratio)}`),
+    kpiCard("剩余敞口", money(portfolio.net_exposure_cny) + " CNY", "扣掉已锁之后仍暴露的部分", "warn"),
+    kpiCard("待锁建议", money(portfolio.recommended_cny) + " CNY", `${portfolio.pending_count} 条建议待处理`, "todo"),
+  ].join("");
+
+  tbody.innerHTML = rows.map((row) => `
+    <tr>
+      <td>${row.currency}</td>
+      <td>${money(row.gross_cny)}</td>
+      <td>${money(row.locked_cny)}</td>
+      <td>${money(row.net_cny)}</td>
+      <td>${ratioBar(row.locked_ratio)} ${ratioText(row.locked_ratio)}</td>
+      <td>${money(row.recommended_cny)}</td>
+    </tr>
+  `).join("");
+
+  const missing = portfolio.rate_missing || [];
+  note.textContent = missing.length
+    ? `各币种取绝对值后相加，不同币种不互相抵消。${missing.join("、")} 暂无汇率，未计入合计。`
+    : "各币种取绝对值后相加，不同币种不互相抵消——净收美元和净付欧元是两个独立的风险。";
+
+  if (badge) badge.textContent = portfolio.pending_count ? String(portfolio.pending_count) : "";
+}
+
+function setupSideNav() {
+  const links = Array.from(document.querySelectorAll(".sidenav a[data-nav]"));
+  if (!links.length) return;
+  const sections = links
+    .map((link) => document.getElementById(link.dataset.nav))
+    .filter(Boolean);
+
+  const activate = (id) => {
+    links.forEach((link) => {
+      link.classList.toggle("active", link.dataset.nav === id);
+    });
+  };
+
+  if ("IntersectionObserver" in window) {
+    const seen = new Map();
+    const observer = new IntersectionObserver(
+      (entries) => {
+        entries.forEach((entry) => seen.set(entry.target.id, entry));
+        const visible = Array.from(seen.values())
+          .filter((entry) => entry.isIntersecting)
+          .sort((a, b) => a.boundingClientRect.top - b.boundingClientRect.top);
+        if (visible.length) activate(visible[0].target.id);
+      },
+      { rootMargin: "-72px 0px -55% 0px", threshold: 0 },
+    );
+    sections.forEach((section) => observer.observe(section));
+  }
+
+  links.forEach((link) => {
+    link.addEventListener("click", () => activate(link.dataset.nav));
+  });
+  activate(links[0].dataset.nav);
 }
 
 function renderRateStatus(data) {
@@ -198,7 +293,9 @@ function renderNetExposure(rows) {
     const rateCell = row.rate_available
       ? `${row.current_rate}`
       : '<span class="warn-tag" title="该币种暂无汇率，人民币金额无法估算">汇率缺失</span>';
-    const riskCell = row.rate_available ? money(row.cny_risk) : "—";
+    const riskCell = row.rate_available
+      ? `${money(row.cny_risk)}${row.over_risk_limit ? ' <span class="warn-tag" title="超过配置的风险阈值，仅作提示">超阈值</span>' : ""}`
+      : "—";
     const tr = document.createElement("tr");
     tr.innerHTML = `
       <td>${row.period}</td>
@@ -215,15 +312,56 @@ function renderNetExposure(rows) {
   });
 }
 
-function renderScenarioRows(suggestions) {
+function renderScenarioTotals(totals, legCount) {
+  const names = ["neutral", "optimistic", "pessimistic", "custom"].filter((n) => totals[n]);
+  if (!names.length) return "";
+  const rows = names.map((name) => {
+    const row = totals[name];
+    return `
+      <tr>
+        <td>${scenarioName(name)}</td>
+        <td>${money(row.unrealized_exchange_gain_loss)}</td>
+        <td>${money(row.hedge_pnl)}</td>
+        <td class="total-cell">${money(row.total_projected_gain_loss)}</td>
+      </tr>
+    `;
+  }).join("");
+  const best = totals.optimistic && totals.pessimistic
+    ? Math.abs(totals.optimistic.total_projected_gain_loss - totals.pessimistic.total_projected_gain_loss)
+    : null;
+  const spread = best === null ? "" : `乐观与悲观两端相差 ${money(best)} CNY。`;
+  return `
+    <div class="item total-item">
+      <strong>全部敞口合计（${legCount} 组期间 × 币种）</strong>
+      <p class="meta">各币种损益已折成人民币，可直接相加；不同到期日按名义金额相加，未做贴现。${spread}</p>
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr>
+              <th>场景</th>
+              <th>未实现汇兑损益</th>
+              <th>套保损益</th>
+              <th>合计预计损益</th>
+            </tr>
+          </thead>
+          <tbody>${rows}</tbody>
+        </table>
+      </div>
+    </div>
+  `;
+}
+
+function renderScenarioRows(entries, totals) {
   const box = document.getElementById("scenarioRows");
   box.innerHTML = "";
-  if (!suggestions.length) {
-    box.innerHTML = '<div class="item">暂无推荐交易，因此没有预计损益场景。</div>';
+  if (!entries.length) {
+    box.innerHTML = '<div class="item">暂无敞口，因此没有预计损益场景。</div>';
     return;
   }
-  suggestions.forEach((item) => {
-    const rows = Object.entries(item.scenario_projection || {}).map(([name, row]) => {
+  // 先给组合层面的总账，再给逐个期间/币种的明细。
+  box.insertAdjacentHTML("beforeend", renderScenarioTotals(totals || {}, entries.length));
+  entries.forEach((item) => {
+    const rows = Object.entries(item.projection || {}).map(([name, row]) => {
       const bucketValue = row[item.accounting_bucket] || 0;
       return `
         <tr>
@@ -237,9 +375,16 @@ function renderScenarioRows(suggestions) {
     }).join("");
     const div = document.createElement("div");
     div.className = "item";
+    // 建议金额为 0 时套保腿为 0，但敞口本身的浮动损益依然要显示。
+    const title = item.has_recommendation
+      ? `${item.period} ${item.currency} 推荐交易预计损益`
+      : `${item.period} ${item.currency} 当前敞口预计损益`;
+    const note = item.has_recommendation
+      ? `建议金额 ${money(item.recommended_amount)}。`
+      : "无新增建议（已达目标套保比例），下表只反映剩余敞口本身的浮动损益。";
     div.innerHTML = `
-      <strong>${item.period} ${item.currency} 推荐交易预计损益</strong>
-      <p class="meta">科目：${bucketName(item.accounting_bucket)}。中性、乐观、悲观、自定义场景按配置的汇率涨跌幅计算。</p>
+      <strong>${title}</strong>
+      <p class="meta">${note}科目：${bucketName(item.accounting_bucket)}。中性、乐观、悲观、自定义场景按配置的汇率涨跌幅计算。</p>
       <div class="table-wrap">
         <table>
           <thead>
@@ -269,55 +414,95 @@ function renderList(id, rows, renderItem) {
   rows.forEach((row) => box.appendChild(renderItem(row)));
 }
 
-function itemShell(row, title, detail, collection) {
-  const div = document.createElement("div");
-  div.className = "item";
-  div.innerHTML = `
-    <strong>${title}</strong>
-    <p>${detail}</p>
-    <p class="meta">${row.description || ""}</p>
-    <button type="button" class="secondary">删除</button>
-  `;
-  div.querySelector("button").addEventListener("click", async () => {
-    if (!window.confirm(`确认删除这条记录？此操作无法撤销。\n${title}`)) return;
-    await runAction("正在删除...", async () => {
-      await api(`/api/${collection}/${row.id}`, { method: "DELETE" });
-      await loadDashboard();
-      showStatus("已删除。");
+function escapeHtml(value) {
+  return String(value == null ? "" : value).replace(/[&<>"']/g, (ch) => ({
+    "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;",
+  }[ch]));
+}
+
+function byDueDate(a, b) {
+  const left = `${a.due_date || ""}${a.currency || ""}`;
+  const right = `${b.due_date || ""}${b.currency || ""}`;
+  return left.localeCompare(right);
+}
+
+// 明细用表格：字段各占一列，能横向比对，不再把信息塞进句子里。
+function renderDetailTable(tbodyId, countId, rows, columns, collection, emptyText) {
+  const body = document.getElementById(tbodyId);
+  const count = document.getElementById(countId);
+  if (!body) return;
+  if (count) count.textContent = rows.length ? `共 ${rows.length} 条` : "";
+  if (!rows.length) {
+    body.innerHTML = `<tr><td colspan="${columns.length + 1}" class="empty-row">${emptyText}</td></tr>`;
+    return;
+  }
+  body.innerHTML = "";
+  rows.slice().sort(byDueDate).forEach((row) => {
+    const tr = document.createElement("tr");
+    const cells = columns.map((col) => {
+      const value = col.render(row);
+      return `<td${col.cls ? ` class="${col.cls}"` : ""}>${value}</td>`;
+    }).join("");
+    tr.innerHTML = `${cells}<td class="col-action"><button type="button" class="row-delete">删除</button></td>`;
+    const title = `${row.due_date || ""} ${row.currency || ""} ${money(row.amount)}`;
+    tr.querySelector("button").addEventListener("click", async () => {
+      if (!window.confirm(`确认删除这条记录？此操作无法撤销。\n${title}`)) return;
+      await runAction("正在删除...", async () => {
+        await api(`/api/${collection}/${row.id}`, { method: "DELETE" });
+        await loadDashboard();
+        showStatus("已删除。");
+      });
     });
+    body.appendChild(tr);
   });
-  return div;
 }
 
-function renderExposure(row) {
-  const direction = row.direction === "receipt" ? "未来收外币" : "未来付外币";
-  return itemShell(
-    row,
-    `${row.due_date} ${row.currency} ${money(row.amount)}`,
-    `${direction}，${riskCategoryName(row.category)}，概率 ${ratioText(row.probability || 1)}`,
-    "exposures",
-  );
+function renderExposureTable(rows) {
+  renderDetailTable("exposureRows", "exposureCount", rows, [
+    { render: (row) => escapeHtml(row.due_date) },
+    { render: (row) => escapeHtml(row.currency) },
+    {
+      render: (row) => row.direction === "receipt"
+        ? '<span class="net-tag net-in">收</span> 未来收外币'
+        : '<span class="net-tag net-out">付</span> 未来付外币',
+    },
+    { render: (row) => money(row.amount), cls: "num" },
+    { render: (row) => ratioText(row.probability == null ? 1 : row.probability), cls: "num" },
+    { render: (row) => escapeHtml(riskCategoryName(row.category)) },
+    { render: (row) => escapeHtml(row.description || "—"), cls: "col-note" },
+  ], "exposures", "还没有敞口，先到「录入」里添加一笔。");
 }
 
-function renderHedge(row) {
-  const action = row.action === "sell_foreign" ? "卖出外币/远期结汇" : "买入外币/远期购汇";
-  return itemShell(
-    row,
-    `${row.due_date} ${row.currency} ${money(row.amount)}`,
-    `${action}，锁定汇率 ${row.locked_rate}`,
-    "hedges",
-  );
+function renderHedgeTable(rows) {
+  renderDetailTable("hedgeRows", "hedgeCount", rows, [
+    { render: (row) => escapeHtml(row.trade_date) },
+    { render: (row) => escapeHtml(row.due_date) },
+    { render: (row) => escapeHtml(row.currency) },
+    {
+      render: (row) => row.action === "sell_foreign"
+        ? "卖出外币/远期结汇"
+        : "买入外币/远期购汇",
+    },
+    { render: (row) => money(row.amount), cls: "num" },
+    { render: (row) => escapeHtml(row.locked_rate), cls: "num" },
+    { render: (row) => escapeHtml(row.description || "—"), cls: "col-note" },
+  ], "hedges", "还没有锁汇记录。");
 }
 
 function renderBacktest(row) {
   const div = document.createElement("div");
   div.className = "item";
   const cls = row.hedge_effect_cny >= 0 ? "positive" : "negative";
+  const settled = row.settled !== false;
+  const tag = settled ? "" : ' <span class="warn-tag" title="尚未录入到期实际汇率，按当前市场价试算">试算</span>';
+  const rateLine = settled
+    ? `实际汇率 ${row.actual_rate}，参考汇率 ${row.reference_rate}`
+    : `未录入实际汇率，按当前市场价 ${row.reference_rate} 试算`;
   div.innerHTML = `
-    <strong>${row.period} ${row.currency}</strong>
+    <strong>${row.period} ${row.currency}</strong>${tag}
     <p>${row.plain_text}</p>
-    <p>锁汇贡献：<span class="${cls}">${money(row.hedge_effect_cny)} CNY</span></p>
-    <p class="meta">业务敞口 ${money(row.business_exposure)}，实际汇率 ${row.actual_rate}，参考汇率 ${row.reference_rate}</p>
+    <p>锁汇贡献${settled ? "" : "（试算）"}：<span class="${cls}">${money(row.hedge_effect_cny)} CNY</span></p>
+    <p class="meta">业务敞口 ${money(row.business_exposure)}，${rateLine}</p>
   `;
   return div;
 }
@@ -446,6 +631,7 @@ async function runAction(busyMessage, action, finallyAction = null) {
 }
 
 bindForms();
+setupSideNav();
 setDefaultDates();
 showStatus("正在加载数据...", "busy");
 loadDashboard()
