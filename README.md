@@ -593,7 +593,8 @@ v2 里还有一个"字面通过但被否决"的例子：`rF` 三条预注册条�
 1. 用一份合成的演示数据在本地跑一遍 `build_dashboard`，把结果烘成 JSON；
 2. 原样复制 `web/index.html` / `app.js` / `styles.css`；
 3. 在 app.js 之前插一段垫片接管 `fetch("/api/…")`——读接口返回烘好的数据，
-   写接口一律 403 并给出可读提示。
+   写接口一律 403 并给出可读提示；
+4. 写一份 `_headers`，让 Cloudflare Pages 给每个响应加上安全头。
 
 演示数据是刻意排过的，每种值得看的情形都留了一个：未来期间（远期贴水看得见、
 中性情景不为 0）、录了实际发生额的已结算期间（价量分解 + 超额套保警告）、
@@ -603,6 +604,18 @@ v2 里还有一个"字面通过但被否决"的例子：`rF` 三条预注册条�
 `test_static_build.py` 钉住这些：垫片确实注入了、且排在 app.js 之前。
 这个脚本靠字符串锚点改 HTML，锚点一变垫片就**静默**不注入——
 本地构建照样成功，部署上去才发现页面在打真实的 `/api` 然后白屏。
+
+`_headers` 里真正在挡事的是三条：`frame-ancestors 'none'` 不让别人把演示站嵌进
+自己的页面里做点击劫持，`connect-src 'self'` 让页面即便被注入也发不出外部请求，
+`X-Robots-Tag: noindex` 给 `robots.txt` 补一道（robots.txt 只管爬虫抓不抓，
+这个头把 noindex 标到每个响应上，非 HTML 资源也覆盖得到）。
+`script-src`/`style-src` 保留 `'unsafe-inline'`——垫片是内联脚本、方法页是内联样式，
+改成 hash 的话锚点一漂就是整页白屏，代价大于收益。
+
+因为 CSP 只放行同源，页面**不能引外部资源**（CDN 字体、统计脚本都不行）：
+本地 `python web_app.py` 不发这些头，这类回归在本地是看不出来的，
+所以 `test_csp_stays_compatible_with_what_the_page_actually_loads` 在构建产物上
+扫一遍外部来源，引了就红。
 
 重新部署：
 

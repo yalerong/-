@@ -8,6 +8,7 @@
 from __future__ import annotations
 
 import json
+import os
 import re
 import subprocess
 import sys
@@ -19,6 +20,12 @@ ROOT = Path(__file__).resolve().parent
 BUILD = ROOT / "demo" / "build_static.py"
 BAKED_RE = r"var BAKED = (\{.*?\});\n"
 
+# 构建脚本的提示和 SystemExit 文案都是中文。子进程默认按控制台编码写出去
+# （Windows 上是 cp936），这边再按 utf-8 解就会失败，subprocess 把 stdout/stderr
+# 留成 None——测试于是死在 `proc.stdout + proc.stderr` 上，而不是死在它要测的事情上。
+# 钉死子进程的 IO 编码，让两边一致。
+UTF8_ENV = {**os.environ, "PYTHONIOENCODING": "utf-8"}
+
 
 class StaticBuildTest(unittest.TestCase):
     @classmethod
@@ -28,6 +35,7 @@ class StaticBuildTest(unittest.TestCase):
         proc = subprocess.run(
             [sys.executable, str(BUILD), str(cls.out)],
             capture_output=True, text=True, encoding="utf-8", cwd=str(ROOT),
+            env=UTF8_ENV,
         )
         assert proc.returncode == 0, proc.stderr
         cls.html = (cls.out / "index.html").read_text(encoding="utf-8")
@@ -38,7 +46,7 @@ class StaticBuildTest(unittest.TestCase):
 
     def test_every_file_the_page_needs_is_there(self):
         for name in ("index.html", "method.html", "robots.txt", "404.html",
-                     "web/app.js", "web/styles.css"):
+                     "_headers", "web/app.js", "web/styles.css"):
             self.assertTrue((self.out / name).exists(), f"缺 {name}")
 
     def test_the_shim_actually_got_injected_before_app_js(self):
@@ -118,12 +126,49 @@ class StaticBuildTest(unittest.TestCase):
                 proc = subprocess.run(
                     [sys.executable, str(BUILD), arg],
                     capture_output=True, text=True, encoding="utf-8", cwd=str(ROOT),
+                    env=UTF8_ENV,
                 )
                 self.assertNotEqual(proc.returncode, 0, f"传 {arg} 居然构建成功了")
                 self.assertIn("拒绝", proc.stdout + proc.stderr)
         # 源文件一个都不能少
         for name in ("demo/build_static.py", "demo/index.html", "web/index.html", "web_app.py"):
             self.assertTrue((ROOT / name).exists(), f"{name} 被删了")
+
+    def test_security_headers_are_emitted_for_every_path(self):
+        text = (self.out / "_headers").read_text(encoding="utf-8")
+        first_line = text.split("\n", 1)[0]
+        self.assertEqual(first_line, "/*",
+                         "规则行必须是 /*，否则这些头只盖到某个子路径上")
+        for header in ("Content-Security-Policy", "X-Content-Type-Options",
+                       "X-Frame-Options", "Referrer-Policy", "X-Robots-Tag"):
+            self.assertIn(f"  {header}: ", text, f"缺 {header}")
+        # 这条是这份 _headers 里唯一挡得住实际攻击的：别人把演示站嵌进自己页面
+        # 做点击劫持。写错成 'self' 之类的话文件照样在、测试照样绿。
+        self.assertIn("frame-ancestors 'none'", text)
+
+    def test_csp_stays_compatible_with_what_the_page_actually_loads(self):
+        """CSP 是 `'self'` 单源的，页面一旦引到外部资源就会在生产上被静默挡掉。
+
+        本地 `python web_app.py` 不发这些头，所以这类回归在本地跑是看不出来的：
+        加个 CDN 字体或统计脚本，本地一切正常，部署上去才发现被 CSP 拦了。
+        这里在构建产物上扫一遍外部来源。
+        """
+        offenders = []
+        for path in sorted(self.out.rglob("*")):
+            if not path.is_file() or path.suffix not in (".html", ".css", ".js"):
+                continue
+            text = path.read_text(encoding="utf-8", errors="ignore")
+            for match in re.finditer(
+                r"""(?:src|href)\s*=\s*["'](https?:)?//[^"']+|@import[^;]*//|url\(\s*["']?(https?:)?//""",
+                text,
+            ):
+                snippet = match.group(0)
+                # 页脚指向 GitHub 仓库的超链接是导航，不受 CSP 取源限制
+                if snippet.startswith("href") and "github.com" in snippet:
+                    continue
+                offenders.append(f"{path.name}: {snippet[:80]}")
+        self.assertEqual(offenders, [],
+                         "CSP 只放行同源，这些外部引用会在演示站上被挡掉")
 
     def test_no_external_attribution_leaks_into_the_bundle(self):
         for path in self.out.rglob("*"):
