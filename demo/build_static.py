@@ -196,6 +196,45 @@ BANNER = """<div class="demo-banner">
 </div>
 """
 
+# Cloudflare Pages 读构建产物里的 `_headers`，给静态响应加头。这里的取值是被
+# 演示站自身的形态卡死的，不是抄来的模板：
+#
+# - `script-src`/`style-src` 必须留 `'unsafe-inline'`。垫片是内联 <script>，
+#   /method 与 404 页是内联 <style>，工作台里还有一处 `style=` 属性。
+#   换成 hash 的话每次构建都要重算，而这个脚本本来就是靠字符串锚点改 HTML 的——
+#   锚点一漂，hash 对不上就是整页白屏，代价远大于收益。
+# - 真正在挡事的是另外几条：`frame-ancestors 'none'` 挡别人把演示站嵌进自己页面里
+#   做点击劫持；`connect-src 'self'` 让页面即便被注入也发不出外部请求；
+#   `object-src`/`base-uri` 断掉两条老注入路径。
+# - `form-action` 用 `'self'` 而不是 `'none'`：四个表单都靠 app.js 的
+#   preventDefault 拦着，万一 app.js 没加载出来会退化成原生提交，
+#   `'self'` 让它原地跳转（无害），`'none'` 只会多一条看不懂的报错。
+# - `X-Robots-Tag` 是给 robots.txt 补一道：robots.txt 只管爬虫抓不抓，
+#   这个头把 noindex 标到每个响应上，非 HTML 资源也覆盖得到。
+CSP = "; ".join([
+    "default-src 'self'",
+    "script-src 'self' 'unsafe-inline'",
+    "style-src 'self' 'unsafe-inline'",
+    "img-src 'self' data:",
+    "font-src 'self'",
+    "connect-src 'self'",
+    "object-src 'none'",
+    "base-uri 'none'",
+    "form-action 'self'",
+    "frame-ancestors 'none'",
+])
+
+HEADERS = f"""/*
+  Content-Security-Policy: {CSP}
+  X-Content-Type-Options: nosniff
+  X-Frame-Options: DENY
+  Referrer-Policy: no-referrer
+  Permissions-Policy: accelerometer=(), camera=(), geolocation=(), gyroscope=(), microphone=(), payment=(), usb=()
+  Cross-Origin-Opener-Policy: same-origin
+  X-Robots-Tag: noindex, nofollow, noarchive
+"""
+
+
 BANNER_CSS = """
 .demo-banner {
   display: flex;
@@ -274,6 +313,9 @@ def main() -> int:
     shutil.copy(ROOT / "demo" / "index.html", out / "method.html")
     for name in ("robots.txt", "404.html"):
         shutil.copy(ROOT / "demo" / name, out / name)
+
+    # Pages 自己消费掉 `_headers`，它不会被当成一个可访问的文件发出去
+    (out / "_headers").write_text(HEADERS, encoding="utf-8")
 
     size = sum(f.stat().st_size for f in out.rglob("*") if f.is_file())
     print(f"输出目录: {out}")
