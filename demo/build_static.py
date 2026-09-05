@@ -171,12 +171,48 @@ SHIM = """<script>
       headers: { "Content-Type": "application/json; charset=utf-8" },
     }));
   }
+  function textReply(text, status, contentType) {
+    return Promise.resolve(new Response(text, {
+      status: status || 200,
+      headers: { "Content-Type": contentType || "text/plain; charset=utf-8" },
+    }));
+  }
   var realFetch = window.fetch.bind(window);
   window.fetch = function (input, init) {
     var path = String((input && input.url) || input || "");
     if (path.indexOf("/api/") === -1) return realFetch(input, init);
     var method = ((init && init.method) || "GET").toUpperCase();
     if (method === "GET" && path.indexOf("/api/state") !== -1) return reply(BAKED);
+    if (method === "GET" && (path.indexOf("/api/export") !== -1 || path.indexOf("/api/workspace/export") !== -1)) return reply({
+      exported_at: BAKED.workspace && BAKED.workspace.metadata && BAKED.workspace.metadata.updated_at,
+      state: BAKED,
+      demo: true,
+    });
+    if (method === "GET" && path.indexOf("/api/csv/export") !== -1) {
+      return textReply("id,due_date,currency,amount,description\\nstatic-demo,,,,只读演示导出\\n", 200, "text/csv; charset=utf-8");
+    }
+    if (method === "GET" && path.indexOf("/api/xlsx/export") !== -1) {
+      return reply({
+        ok: false,
+        error: "这是只读的静态演示站，不能导出 Excel。真实工具在本地运行（见页脚仓库链接）。",
+      }, 403);
+    }
+    if (path.indexOf("/api/csv/import") !== -1) {
+      return reply({
+        ok: false,
+        error: "这是只读的静态演示站，不能导入 CSV。真实工具在本地运行（见页脚仓库链接）。",
+      }, 403);
+    }
+    if (path.indexOf("/api/xlsx/import") !== -1) {
+      return reply({
+        ok: false,
+        error: "这是只读的静态演示站，不能导入 Excel。真实工具在本地运行（见页脚仓库链接）。",
+      }, 403);
+    }
+    if (method === "GET" && path.indexOf("/api/backups") !== -1) return reply({
+      backups: [],
+      data_file: "static demo",
+    });
     return reply({
       ok: false,
       error: "这是只读的静态演示站，改不了数据。真实工具在本地运行（见页脚仓库链接）。",

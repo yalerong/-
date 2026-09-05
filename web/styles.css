@@ -217,7 +217,8 @@ label {
 }
 
 input,
-select {
+select,
+textarea {
   width: 100%;
   min-height: 36px;
   border: 1px solid var(--line);
@@ -225,6 +226,20 @@ select {
   padding: 7px 9px;
   color: var(--text);
   background: var(--panel);
+}
+
+textarea {
+  resize: vertical;
+  font-family: Consolas, "Courier New", monospace;
+}
+
+input:focus,
+select:focus,
+textarea:focus,
+button:focus-visible,
+.sidenav a:focus-visible {
+  outline: 2px solid var(--info);
+  outline-offset: 2px;
 }
 
 button {
@@ -240,6 +255,15 @@ button {
 
 button:hover {
   background: var(--accent-dark);
+}
+
+button:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+
+button:disabled:hover {
+  background: var(--accent);
 }
 
 button.secondary {
@@ -263,6 +287,20 @@ button.danger-outline:hover {
   display: flex;
   gap: 8px;
   flex-wrap: wrap;
+  align-items: center;
+}
+
+.workspace-badge {
+  max-width: 460px;
+  padding: 5px 9px;
+  border: 1px solid var(--accent-line);
+  border-radius: 6px;
+  background: var(--accent-soft);
+  color: var(--topbar-text);
+  font-size: 12px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .notice,
@@ -335,6 +373,15 @@ ol {
 
 .table-wrap {
   overflow-x: auto;
+  border-radius: 6px;
+  background:
+    linear-gradient(90deg, var(--panel) 30%, transparent),
+    linear-gradient(270deg, var(--panel) 30%, transparent) 100% 0,
+    linear-gradient(90deg, rgba(0, 0, 0, 0.12), transparent),
+    linear-gradient(270deg, rgba(0, 0, 0, 0.12), transparent) 100% 0;
+  background-repeat: no-repeat;
+  background-size: 28px 100%, 28px 100%, 12px 100%, 12px 100%;
+  background-attachment: local, local, scroll, scroll;
 }
 
 table {
@@ -419,6 +466,17 @@ th {
 
   .actions {
     margin-top: 12px;
+  }
+
+  .topbar .actions {
+    width: 100%;
+    min-width: 0;
+  }
+
+  .topbar .workspace-badge {
+    flex: 1 1 100%;
+    max-width: 100%;
+    min-width: 0;
   }
 }
 
@@ -645,6 +703,21 @@ th {
   cursor: pointer;
 }
 
+.row-edit,
+.row-copy {
+  padding: 3px 10px;
+  font-size: 12px;
+  background: transparent;
+  color: var(--info);
+  border: 1px solid var(--info-line);
+  border-radius: 5px;
+}
+
+.row-edit:hover,
+.row-copy:hover {
+  background: var(--info-soft);
+}
+
 .row-delete:hover {
   background: var(--danger-soft);
 }
@@ -692,4 +765,33 @@ th {
 
 .notice-warn {
   color: var(--warn);
+}
+
+.setup-panel {
+  border-left: 3px solid var(--accent);
+}
+
+.data-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+  align-items: center;
+  margin: 12px 0;
+}
+
+.file-action {
+  display: inline-flex;
+  width: auto;
+  min-height: 36px;
+  align-items: center;
+  padding: 7px 10px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  color: var(--text);
+  background: var(--panel-2);
+  cursor: pointer;
+}
+
+.file-action input {
+  display: none;
 }

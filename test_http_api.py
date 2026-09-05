@@ -17,10 +17,18 @@ from pathlib import Path
 import web_app
 
 
-def request(method: str, url: str, payload: dict | None = None) -> tuple[int, dict]:
+def request(
+    method: str,
+    url: str,
+    payload: dict | None = None,
+    headers: dict[str, str] | None = None,
+) -> tuple[int, dict]:
     data = None if payload is None else json.dumps(payload).encode("utf-8")
     req = urllib.request.Request(url, data=data, method=method)
-    req.add_header("Content-Type", "application/json")
+    if payload is not None:
+        req.add_header("Content-Type", "application/json")
+    for key, value in (headers or {}).items():
+        req.add_header(key, value)
     try:
         with urllib.request.urlopen(req, timeout=10) as response:
             body = response.read().decode("utf-8")
@@ -116,6 +124,37 @@ class HttpApiTest(unittest.TestCase):
         self.assertEqual(status, 200)
         self.assertEqual(payload["deleted"], 1)
 
+    def test_update_exposure_with_put_keeps_id_and_audits_change(self):
+        status, _ = request("POST", f"{self.base}/api/exposures", {
+            "due_date": "2026-09-30",
+            "currency": "USD",
+            "amount": 1000,
+            "direction": "receipt",
+            "category": "cash_flow",
+        })
+        self.assertEqual(status, 200)
+        _, data = request("GET", f"{self.base}/api/state")
+        record_id = next(row["id"] for row in data["exposures"] if row["due_date"] == "2026-09-30")
+
+        status, payload = request("PUT", f"{self.base}/api/exposures/{record_id}", {
+            "due_date": "2026-10-31",
+            "currency": "EUR",
+            "amount": 2500,
+            "direction": "payment",
+            "category": "balance_sheet",
+            "description": "changed",
+        })
+
+        self.assertEqual(status, 200)
+        self.assertEqual(payload["record"]["id"], record_id)
+        self.assertEqual(payload["record"]["currency"], "EUR")
+        _, data = request("GET", f"{self.base}/api/state")
+        updated = next(row for row in data["exposures"] if row["id"] == record_id)
+        self.assertEqual(updated["amount"], 2500)
+        audit = next(row for row in data["audit"] if row["action"] == "update")
+        self.assertEqual(audit["before"]["amount"], 1000)
+        self.assertEqual(audit["after"]["amount"], 2500)
+
     def test_delete_unknown_id_is_404(self):
         status, payload = request("DELETE", f"{self.base}/api/exposures/does-not-exist")
         self.assertEqual(status, 404)
@@ -157,6 +196,54 @@ class HttpApiTest(unittest.TestCase):
         # 只传了一个字段，其他默认值不能被抹掉
         self.assertEqual(payload["config"]["base_currency"], "CNY")
         self.assertIn("supported_currencies", payload["config"])
+
+    def test_export_import_and_backup_restore_round_trip_workspace(self):
+        _, original = request("GET", f"{self.base}/api/state")
+        status, exported = request("GET", f"{self.base}/api/export")
+        self.assertEqual(status, 200)
+        self.assertIn("state", exported)
+        self.assertEqual(exported["state"]["exposures"], original["exposures"])
+
+        request("POST", f"{self.base}/api/exposures", {
+            "due_date": "2027-01-31", "currency": "USD", "amount": 321,
+            "direction": "receipt", "category": "cash_flow",
+        })
+        status, restored = request("POST", f"{self.base}/api/import", {"state": exported["state"]})
+        self.assertEqual(status, 200)
+        self.assertGreaterEqual(restored["backup_count"], 1)
+        _, after_import = request("GET", f"{self.base}/api/state")
+        self.assertEqual(after_import["exposures"], original["exposures"])
+
+        request("POST", f"{self.base}/api/exposures", {
+            "due_date": "2027-02-28", "currency": "USD", "amount": 654,
+            "direction": "receipt", "category": "cash_flow",
+        })
+        status, backups = request("GET", f"{self.base}/api/backups")
+        self.assertEqual(status, 200)
+        self.assertTrue(backups["backups"])
+        status, _ = request(
+            "POST",
+            f"{self.base}/api/backups/{backups['backups'][0]['name']}/restore",
+            {},
+        )
+        self.assertEqual(status, 200)
+
+    def test_mutating_api_rejects_cross_origin_and_non_json_requests(self):
+        status, body = request("POST", f"{self.base}/api/exposures", {
+            "due_date": "2026-09-30", "currency": "USD", "amount": 100,
+            "direction": "receipt", "category": "cash_flow",
+        }, headers={"Origin": "https://evil.example"})
+        self.assertEqual(status, 403)
+        self.assertIn("origin", body["error"].lower())
+
+        req = urllib.request.Request(
+            f"{self.base}/api/exposures", data=b"{}", method="POST",
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=10) as response:
+                self.fail(f"expected 415, got {response.status}")
+        except urllib.error.HTTPError as exc:
+            self.assertEqual(exc.code, 415)
 
     # ---------- 审计 ----------
 

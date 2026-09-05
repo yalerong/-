@@ -178,6 +178,54 @@ class StaticBuildTest(unittest.TestCase):
             for word in ("酷滴", "114463", "fx_patent_reconstruction"):
                 self.assertNotIn(word, text, f"{path.name} 里有不该外发的表述：{word}")
 
+    def test_live_page_exposes_workspace_management_and_advanced_controls(self):
+        source_html = (ROOT / "web" / "index.html").read_text(encoding="utf-8")
+        source_js = (ROOT / "web" / "app.js").read_text(encoding="utf-8")
+        source_css = (ROOT / "web" / "styles.css").read_text(encoding="utf-8")
+
+        for marker in (
+            'id="workspaceBadge"', 'id="setupPanel"', 'id="dataManagement"',
+            'id="exportWorkspaceBtn"', 'id="importWorkspaceFile"',
+            'id="csvCollectionSelect"', 'id="exportCsvBtn"', 'id="importCsvFile"',
+            'id="exportXlsxBtn"', 'id="importXlsxFile"',
+            'id="restoreLatestBackupBtn"', 'id="undoDeleteBtn"', 'id="clearBusinessBtn"',
+            'name="supported_currencies"',
+            'name="interest_rates"', 'name="forward_overrides"',
+            'name="month_currency_hedge_ratios"', 'name="scenario_shifts"',
+            'name="monthly_average_rates"',
+        ):
+            self.assertIn(marker, source_html)
+        self.assertIn('"Content-Type": "application/json"', source_js)
+        self.assertIn('"PUT"', source_js)
+        self.assertIn("parseConfigJsonFields", source_js)
+        self.assertIn("localToday", source_js)
+        self.assertIn("默认套保比例（%）", source_html)
+        self.assertIn("CONFIG_PERCENT_FIELDS", source_js)
+        self.assertEqual(source_js.count("Number(data[key]) / 100"), 1,
+                         "配置百分比只能换算一次，否则 80% 会被保存成 0.8%")
+        self.assertIn("Number(config[key]) * 100", source_js)
+        self.assertIn("badge.title = badge.textContent", source_js)
+        self.assertIn(".topbar .workspace-badge", source_css)
+
+    def test_detail_tables_have_closed_sections_for_editable_rows(self):
+        source_html = (ROOT / "web" / "index.html").read_text(encoding="utf-8")
+        for tbody_id in ("exposureRows", "hedgeRows", "settlementRows"):
+            with self.subTest(tbody_id=tbody_id):
+                tbody_at = source_html.index(f'id="{tbody_id}"')
+                table_close_at = source_html.index("</table>", tbody_at)
+                section_close_at = source_html.index("</section>", table_close_at)
+                next_panel_at = source_html.find('<section class="panel"', tbody_at + 1)
+                self.assertTrue(next_panel_at == -1 or section_close_at < next_panel_at)
+
+    def test_static_demo_write_failures_are_user_readable_for_new_routes(self):
+        self.assertIn("/api/backups", self.html)
+        self.assertIn("/api/export", self.html)
+        self.assertIn("/api/csv/export", self.html)
+        self.assertIn("/api/csv/import", self.html)
+        self.assertIn("/api/xlsx/export", self.html)
+        self.assertIn("/api/xlsx/import", self.html)
+        self.assertIn("只读", self.html)
+
 
 if __name__ == "__main__":
     unittest.main()

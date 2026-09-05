@@ -13,8 +13,9 @@ class WriteSeriesTest(unittest.TestCase):
         with mock.patch.object(cn_fetch, "MARKET_DIR", cn_fetch.ROOT / "data" / "tmp"):
             path = cn_fetch.write_series("_TEST_SERIES", [
                 ("2026-01-03", 7.1), ("2026-01-02", 7.0), ("2026-01-03", 7.1)])
-            rows = list(csv.DictReader(path.open(encoding="utf-8")))
-            path.unlink()
+        with path.open(encoding="utf-8") as handle:
+            rows = list(csv.DictReader(handle))
+        path.unlink()
         self.assertEqual([r["date"] for r in rows], ["2026-01-02", "2026-01-03"])
 
 

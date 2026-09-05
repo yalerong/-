@@ -1,5 +1,17 @@
 const fmt = new Intl.NumberFormat("zh-CN", { maximumFractionDigits: 2 });
 let dashboard = null;
+let lastDeleted = null;
+const FORM_TITLES = {
+  exposureForm: "保存敞口",
+  hedgeForm: "记录锁汇",
+  settlementForm: "保存实际汇率",
+};
+const CONFIG_PERCENT_FIELDS = new Set([
+  "default_hedge_ratio",
+  "optimistic_shift_pct",
+  "pessimistic_shift_pct",
+  "custom_scenario_shift_pct",
+]);
 
 function showStatus(message, type = "ok") {
   const box = document.getElementById("statusBar");
@@ -11,7 +23,17 @@ function money(value) {
   return fmt.format(Number(value || 0));
 }
 
+function localToday() {
+  const now = new Date();
+  const local = new Date(now.getTime() - now.getTimezoneOffset() * 60000);
+  return local.toISOString().slice(0, 10);
+}
+
 function today() {
+  return localToday();
+}
+
+function isoStamp() {
   return new Date().toISOString().slice(0, 10);
 }
 
@@ -22,9 +44,13 @@ function setDefaultDates() {
 }
 
 async function api(path, options = {}) {
+  const headers = {
+    "Content-Type": "application/json",
+    ...(options.headers || {}),
+  };
   const response = await fetch(path, {
-    headers: { "Content-Type": "application/json" },
     ...options,
+    headers,
   });
   const data = await response.json();
   if (!response.ok || data.ok === false) {
@@ -53,8 +79,49 @@ function formData(form) {
   for (const key of numericKeys) {
     if (data[key] !== undefined && data[key] !== "") data[key] = Number(data[key]);
   }
+  if (data.probability !== undefined && data.probability !== "") {
+    data.probability = Number(data.probability) / 100;
+  }
+  for (const key of CONFIG_PERCENT_FIELDS) {
+    if (data[key] !== undefined && data[key] !== "") data[key] = Number(data[key]) / 100;
+  }
   if (data.currency) data.currency = data.currency.toUpperCase();
   return data;
+}
+
+function parseConfigJsonFields(form) {
+  const parsed = {};
+  const errorBox = document.getElementById("configJsonError");
+  if (errorBox) errorBox.textContent = "";
+  for (const field of form.querySelectorAll("[data-json-field]")) {
+    const raw = field.value.trim();
+    if (!raw) {
+      parsed[field.name] = {};
+      continue;
+    }
+    try {
+      const value = JSON.parse(raw);
+      const expectsArray = field.dataset.jsonType === "array";
+      const valid = expectsArray
+        ? Array.isArray(value)
+        : value && !Array.isArray(value) && typeof value === "object";
+      if (!valid) {
+        throw new Error(expectsArray ? "必须是 JSON 数组" : "必须是 JSON 对象");
+      }
+      parsed[field.name] = value;
+    } catch (error) {
+      const label = field.closest("label")?.childNodes[0]?.textContent?.trim() || field.name;
+      const message = `${label} 解析失败：${error.message}`;
+      if (errorBox) errorBox.textContent = message;
+      field.focus();
+      throw new Error(message);
+    }
+  }
+  return parsed;
+}
+
+function configFormData(form) {
+  return { ...formData(form), ...parseConfigJsonFields(form) };
 }
 
 async function loadDashboard() {
@@ -78,18 +145,36 @@ function scenarioAssumptionNote(uniform) {
 }
 
 function renderDashboard(data) {
+  renderWorkspace(data.workspace || {});
   renderRateStatus(data);
   renderPortfolio(data.portfolio || {});
   renderSuggestions(data.suggestions || []);
   renderNetExposure(data.net_exposures || []);
   renderExposureTable(data.exposures || []);
   renderHedgeTable(data.hedges || []);
+  renderSettlementTable(data.settlements || []);
   renderScenarioRows(data.scenario_rows || [], data.scenario_totals || {}, data.scenario_uniform);
   renderList("backtestRows", data.backtest || [], renderBacktest);
   renderPlanDrift(data.plan_drift || {});
   renderPlans(data.plans || []);
   renderAudit(data.audit || []);
   renderConfig(data.config || {});
+}
+
+function renderWorkspace(workspace) {
+  const badge = document.getElementById("workspaceBadge");
+  const setup = document.getElementById("setupPanel");
+  const file = document.getElementById("dataFilePath");
+  const backups = document.getElementById("backupStatus");
+  const mode = workspace.data_mode || "unknown";
+  if (badge) {
+    badge.textContent = `${mode === "sample" ? "样例数据" : mode === "empty" ? "空白工作区" : "真实工作区"} · ${workspace.data_file || ""}`;
+    badge.title = badge.textContent;
+    badge.className = `workspace-badge workspace-${mode}`;
+  }
+  if (setup) setup.hidden = Boolean(workspace.setup_complete);
+  if (file) file.textContent = workspace.data_file ? `当前文件：${workspace.data_file}` : "";
+  if (backups) backups.textContent = `可用备份：${workspace.backup_count || 0} 个`;
 }
 
 function rateStatusText(status) {
@@ -151,7 +236,7 @@ function renderPortfolio(portfolio) {
 
   tbody.innerHTML = rows.map((row) => `
     <tr>
-      <td>${row.currency}</td>
+      <td>${escapeHtml(row.currency)}</td>
       <td>${money(row.gross_cny)}</td>
       <td>${money(row.locked_cny)}</td>
       <td>${money(row.net_cny)}</td>
@@ -224,9 +309,10 @@ function renderSuggestions(items) {
       ? `${ratioText(item.target_hedge_ratio)} → 实际 ${ratioText(item.effective_hedge_ratio)}`
       : ratioText(item.target_hedge_ratio);
     card.innerHTML = `
-      <strong>${item.period} ${item.currency}</strong>${item.past_due ? ' <span class="warn-tag" title="到期日已过，这笔敞口还挂在建议里，说明没有被处理掉">已过期</span>' : ""}${item.direction_unexpected ? ' <span class="warn-tag" title="净敞口方向和配置的企业类型相反，多半是录入有误，方向仍按净敞口走">方向异常</span>' : ""}
-      <p>${item.plain_text}</p>
+      <strong>${escapeHtml(item.period)} ${escapeHtml(item.currency)}</strong>${item.past_due ? ' <span class="warn-tag" title="到期日已过，这笔敞口还挂在建议里，说明没有被处理掉">已过期</span>' : ""}${item.direction_unexpected ? ' <span class="warn-tag" title="净敞口方向和配置的企业类型相反，多半是录入有误，方向仍按净敞口走">方向异常</span>' : ""}
+      <p>${escapeHtml(item.plain_text)}</p>
       ${renderForecastBlock(item)}
+      ${item.trial ? `<p class="notice notice-warn">试算建议：${(item.trial_reasons || []).map(escapeHtml).join("；")}</p>` : ""}
       <p class="meta">剩余敞口：${money(item.net_exposure)}，目标套保比例：${ratioLine}，损益科目：${bucketName(item.accounting_bucket)}</p>
       <p class="meta">建议金额：${money(item.recommended_amount)}，交易汇率：${item.trade_rate}${forwardTag(item)}，人民币风险：${money(item.risk_cny)}</p>
       ${forwardLine(item)}
@@ -346,8 +432,8 @@ function renderNetExposure(rows) {
       : "—";
     const tr = document.createElement("tr");
     tr.innerHTML = `
-      <td>${row.period}${row.past_due ? ' <span class="warn-tag" title="到期日已过">已过期</span>' : ""}${row.direction_unexpected ? ' <span class="warn-tag" title="净敞口方向和配置的企业类型相反，多半是录入有误；方向仍按净敞口走">方向异常</span>' : ""}</td>
-      <td>${row.currency}</td>
+      <td>${escapeHtml(row.period)}${row.past_due ? ' <span class="warn-tag" title="到期日已过">已过期</span>' : ""}${row.direction_unexpected ? ' <span class="warn-tag" title="净敞口方向和配置的企业类型相反，多半是录入有误；方向仍按净敞口走">方向异常</span>' : ""}</td>
+      <td>${escapeHtml(row.currency)}</td>
       <td>${riskCategoryCell(row.risk_category, row.risk_category_known)}</td>
       <td>${ratioText(row.target_hedge_ratio)}</td>
       <td>${money(row.business_exposure)}</td>
@@ -426,8 +512,8 @@ function renderScenarioRows(entries, totals, uniform) {
     div.className = "item";
     // 建议金额为 0 时套保腿为 0，但敞口本身的浮动损益依然要显示。
     const title = item.has_recommendation
-      ? `${item.period} ${item.currency} 推荐交易预计损益`
-      : `${item.period} ${item.currency} 当前敞口预计损益`;
+      ? `${escapeHtml(item.period)} ${escapeHtml(item.currency)} 推荐交易预计损益`
+      : `${escapeHtml(item.period)} ${escapeHtml(item.currency)} 当前敞口预计损益`;
     const note = item.has_recommendation
       ? `建议金额 ${money(item.recommended_amount)}。`
       : "无新增建议（已达目标套保比例），下表只反映剩余敞口本身的浮动损益。";
@@ -492,18 +578,107 @@ function renderDetailTable(tbodyId, countId, rows, columns, collection, emptyTex
       const value = col.render(row);
       return `<td${col.cls ? ` class="${col.cls}"` : ""}>${value}</td>`;
     }).join("");
-    tr.innerHTML = `${cells}<td class="col-action"><button type="button" class="row-delete">删除</button></td>`;
+    tr.innerHTML = `${cells}<td class="col-action"><button type="button" class="row-edit">编辑</button> <button type="button" class="row-copy">复制</button> <button type="button" class="row-delete">删除</button></td>`;
     const title = `${row.due_date || ""} ${row.currency || ""} ${money(row.amount)}`;
-    tr.querySelector("button").addEventListener("click", async () => {
-      if (!window.confirm(`确认删除这条记录？此操作无法撤销。\n${title}`)) return;
+    tr.querySelector(".row-edit").addEventListener("click", () => startEdit(collection, row));
+    tr.querySelector(".row-copy").addEventListener("click", () => copyRow(collection, row));
+    tr.querySelector(".row-delete").addEventListener("click", async () => {
+      if (!window.confirm(`确认删除这条记录？\n${title}`)) return;
       await runAction("正在删除...", async () => {
         await api(`/api/${collection}/${row.id}`, { method: "DELETE" });
+        lastDeleted = { collection, row: snapshotRecord(row) };
+        updateUndoButton();
         await loadDashboard();
-        showStatus("已删除。");
+        showStatus("已删除。可在「数据管理」里撤销最近一次删除。");
       });
     });
     body.appendChild(tr);
   });
+}
+
+function cloneRecord(row) {
+  const clone = { ...row };
+  delete clone.id;
+  delete clone.created_at;
+  return clone;
+}
+
+function snapshotRecord(row) {
+  return JSON.parse(JSON.stringify(row));
+}
+
+async function copyRow(collection, row) {
+  await runAction("正在复制记录...", async () => {
+    await api(`/api/${collection}`, { method: "POST", body: JSON.stringify(cloneRecord(row)) });
+    await loadDashboard();
+    showStatus("已复制为一条新记录。");
+  });
+}
+
+function updateUndoButton() {
+  const button = document.getElementById("undoDeleteBtn");
+  if (button) button.disabled = !lastDeleted;
+}
+
+async function undoDeleted() {
+  if (!lastDeleted) {
+    showStatus("没有可撤销的删除。", "error");
+    return;
+  }
+  const { collection, row } = lastDeleted;
+  await runAction("正在撤销删除...", async () => {
+    await api(`/api/${collection}`, { method: "POST", body: JSON.stringify(row) });
+    lastDeleted = null;
+    updateUndoButton();
+    await loadDashboard();
+    showStatus("已撤销最近一次删除。");
+  });
+}
+
+function startEdit(collection, row) {
+  const formId = { exposures: "exposureForm", hedges: "hedgeForm", settlements: "settlementForm" }[collection];
+  const form = document.getElementById(formId);
+  if (!form) return;
+  form.dataset.editId = row.id;
+  Object.entries(row).forEach(([key, value]) => {
+    if (!form.elements[key]) return;
+    if (form.elements[key].type === "checkbox") {
+      form.elements[key].checked = Boolean(value);
+    } else if (key === "probability") {
+      form.elements[key].value = Math.round(Number(value == null ? 1 : value) * 100);
+    } else {
+      form.elements[key].value = value == null ? "" : value;
+    }
+  });
+  const button = form.querySelector('button[type="submit"]');
+  if (button) button.textContent = "保存修改";
+  ensureCancelEditButton(form);
+  form.scrollIntoView({ behavior: "smooth", block: "center" });
+  showStatus("已载入记录，修改后点保存。", "busy");
+}
+
+function ensureCancelEditButton(form) {
+  if (form.querySelector(".cancel-edit")) return;
+  const cancel = document.createElement("button");
+  cancel.type = "button";
+  cancel.className = "secondary cancel-edit";
+  cancel.textContent = "取消编辑";
+  cancel.addEventListener("click", () => resetEdit(form));
+  form.appendChild(cancel);
+}
+
+function resetEdit(form) {
+  delete form.dataset.editId;
+  const button = form.querySelector('button[type="submit"]');
+  if (button) button.textContent = FORM_TITLES[form.id] || button.textContent;
+  const cancel = form.querySelector(".cancel-edit");
+  if (cancel) cancel.remove();
+  form.reset();
+  setDefaultDates();
+  if (form.id === "exposureForm") {
+    categoryTouched = false;
+    updateCategoryHint();
+  }
 }
 
 // ---- category:begin ---- 与 web_app.suggest_category 逐行对应，改动必须两侧同步
@@ -591,6 +766,16 @@ function renderHedgeTable(rows) {
   ], "hedges", "还没有锁汇记录。");
 }
 
+function renderSettlementTable(rows) {
+  renderDetailTable("settlementRows", "settlementCount", rows, [
+    { render: (row) => escapeHtml(row.due_date) },
+    { render: (row) => escapeHtml(row.currency) },
+    { render: (row) => escapeHtml(row.actual_rate), cls: "num" },
+    { render: (row) => row.actual_amount == null ? "—" : money(row.actual_amount), cls: "num" },
+    { render: (row) => escapeHtml(row.description || "—"), cls: "col-note" },
+  ], "settlements", "还没有结算记录。");
+}
+
 function renderBacktest(row) {
   const div = document.createElement("div");
   div.className = "item";
@@ -601,8 +786,8 @@ function renderBacktest(row) {
     ? `实际汇率 ${row.actual_rate}，参考汇率 ${row.reference_rate}`
     : `未录入实际汇率，按当前市场价 ${row.reference_rate} 试算`;
   div.innerHTML = `
-    <strong>${row.period} ${row.currency}</strong>${tag}
-    <p>${row.plain_text}</p>
+    <strong>${escapeHtml(row.period)} ${escapeHtml(row.currency)}</strong>${tag}
+    <p>${escapeHtml(row.plain_text)}</p>
     <p>锁汇贡献${settled ? "" : "（试算）"}：<span class="${cls}">${money(row.hedge_effect_cny)} CNY</span>
       <span class="meta">（对到期即期，交易员口径）</span></p>
     <p class="meta">业务敞口 ${money(row.business_exposure)}，${rateLine}</p>
@@ -617,6 +802,9 @@ const AUDIT_ACTIONS = {
   update: "修改",
   reset: "恢复样例",
   freeze: "冻结方案",
+  clear: "清空",
+  import: "导入",
+  restore: "恢复备份",
 };
 
 const AUDIT_COLLECTIONS = {
@@ -735,6 +923,7 @@ const DECISION_LABELS = {
   month_currency_hedge_ratios: "分月份/币种套保比例",
   interest_rates: "利率（影响远期价）",
   forward_overrides: "远期报价",
+  supported_currencies: "支持币种",
   strategy_type: "策略类型",
   optimistic_shift_pct: "乐观涨跌幅",
   pessimistic_shift_pct: "悲观涨跌幅",
@@ -839,12 +1028,15 @@ function renderConfig(config) {
   const form = document.getElementById("configForm");
   form.rate_api_url.value = config.rate_api_url || "";
   form.rate_cache_hours.value = config.rate_cache_hours || 24;
-  form.risk_limit_cny.value = config.risk_limit_cny || 200000;
+  form.risk_limit_cny.value = config.risk_limit_cny ?? 200000;
   form.enterprise_type.value = config.enterprise_type || "comprehensive";
-  form.default_hedge_ratio.value = config.default_hedge_ratio ?? 0.8;
-  form.optimistic_shift_pct.value = config.optimistic_shift_pct ?? 0.03;
-  form.pessimistic_shift_pct.value = config.pessimistic_shift_pct ?? -0.03;
-  form.custom_scenario_shift_pct.value = config.custom_scenario_shift_pct ?? 0.01;
+  for (const key of CONFIG_PERCENT_FIELDS) {
+    form.elements[key].value = config[key] == null ? "" : Number(config[key]) * 100;
+  }
+  for (const field of form.querySelectorAll("[data-json-field]")) {
+    const fallback = field.dataset.jsonType === "array" ? [] : {};
+    field.value = JSON.stringify(config[field.name] || fallback, null, 2);
+  }
 }
 
 const RISK_CATEGORY_NAMES = {
@@ -886,8 +1078,202 @@ function ratioText(value) {
   return `${Math.round(Number(value || 0) * 10000) / 100}%`;
 }
 
+function bindSetupPanel() {
+  const empty = document.getElementById("startEmptyBtn");
+  const sample = document.getElementById("startSampleBtn");
+  if (empty) empty.addEventListener("click", async () => {
+    await runAction("正在创建空白工作区...", async () => {
+      await api("/api/workspace/empty", { method: "POST", body: "{}" });
+      await loadDashboard();
+      showStatus("空白工作区已就绪。");
+    });
+  });
+  if (sample) sample.addEventListener("click", async () => {
+    await runAction("正在加载样例...", async () => {
+      await api("/api/workspace/sample", { method: "POST", body: "{}" });
+      await loadDashboard();
+      showStatus("样例数据已加载。");
+    });
+  });
+}
+
+function bindDataManagement() {
+  const exportBtn = document.getElementById("exportWorkspaceBtn");
+  const importFile = document.getElementById("importWorkspaceFile");
+  const exportCsvBtn = document.getElementById("exportCsvBtn");
+  const importCsvFile = document.getElementById("importCsvFile");
+  const exportXlsxBtn = document.getElementById("exportXlsxBtn");
+  const importXlsxFile = document.getElementById("importXlsxFile");
+  const restoreBtn = document.getElementById("restoreLatestBackupBtn");
+  const clearBtn = document.getElementById("clearBusinessBtn");
+  const undoBtn = document.getElementById("undoDeleteBtn");
+  if (exportBtn) exportBtn.addEventListener("click", exportWorkspace);
+  if (importFile) importFile.addEventListener("change", importWorkspace);
+  if (exportCsvBtn) exportCsvBtn.addEventListener("click", exportCsv);
+  if (importCsvFile) importCsvFile.addEventListener("change", importCsv);
+  if (exportXlsxBtn) exportXlsxBtn.addEventListener("click", exportXlsx);
+  if (importXlsxFile) importXlsxFile.addEventListener("change", importXlsx);
+  if (restoreBtn) restoreBtn.addEventListener("click", restoreLatestBackup);
+  if (clearBtn) clearBtn.addEventListener("click", clearBusinessData);
+  if (undoBtn) {
+    undoBtn.addEventListener("click", undoDeleted);
+    updateUndoButton();
+  }
+}
+
+function selectedCsvCollection() {
+  const select = document.getElementById("csvCollectionSelect");
+  return select ? select.value : "exposures";
+}
+
+async function exportWorkspace() {
+  await runAction("正在导出工作区...", async () => {
+    const exported = await api("/api/workspace/export");
+    const blob = new Blob([JSON.stringify(exported, null, 2)], { type: "application/json" });
+    const link = document.createElement("a");
+    link.href = URL.createObjectURL(blob);
+    link.download = `fx-workspace-${isoStamp()}.json`;
+    link.click();
+    URL.revokeObjectURL(link.href);
+    showStatus("工作区 JSON 已导出。");
+  });
+}
+
+async function importWorkspace(event) {
+  const file = event.currentTarget.files && event.currentTarget.files[0];
+  if (!file) return;
+  try {
+    const parsed = JSON.parse(await file.text());
+    if (!window.confirm("导入会覆盖当前工作区；系统会先自动备份当前数据。确认继续？")) return;
+    await runAction("正在导入工作区...", async () => {
+      await api("/api/import", { method: "POST", body: JSON.stringify(parsed) });
+      await loadDashboard();
+      showStatus("工作区已导入。");
+    });
+  } catch (error) {
+    showStatus(`导入失败：${error.message}`, "error");
+  } finally {
+    event.currentTarget.value = "";
+  }
+}
+
+async function exportCsv() {
+  const collection = selectedCsvCollection();
+  await runAction("正在导出明细 CSV...", async () => {
+    const response = await fetch(`/api/csv/export?collection=${encodeURIComponent(collection)}`);
+    if (!response.ok) {
+      let message = `HTTP ${response.status}`;
+      try {
+        const payload = await response.json();
+        message = payload.error || message;
+      } catch (_) {
+        message = await response.text() || message;
+      }
+      throw new Error(message);
+    }
+    const blob = new Blob([await response.text()], { type: "text/csv;charset=utf-8" });
+    const link = document.createElement("a");
+    link.href = URL.createObjectURL(blob);
+    link.download = `${collection}-${isoStamp()}.csv`;
+    link.click();
+    URL.revokeObjectURL(link.href);
+    showStatus("明细 CSV 已导出。");
+  });
+}
+
+async function importCsv(event) {
+  const file = event.currentTarget.files && event.currentTarget.files[0];
+  if (!file) return;
+  const collection = selectedCsvCollection();
+  try {
+    const csv = await file.text();
+    if (!window.confirm("导入 CSV 会追加到所选类型的当前明细；系统会先全量校验，失败不会落盘。确认继续？")) return;
+    await runAction("正在导入明细 CSV...", async () => {
+      await api("/api/csv/import", { method: "POST", body: JSON.stringify({ collection, csv }) });
+      await loadDashboard();
+      showStatus("明细 CSV 已导入。");
+    });
+  } catch (error) {
+    showStatus(`CSV 导入失败：${error.message}`, "error");
+  } finally {
+    event.currentTarget.value = "";
+  }
+}
+
+async function exportXlsx() {
+  const collection = selectedCsvCollection();
+  await runAction("正在导出明细 Excel...", async () => {
+    const response = await fetch(`/api/xlsx/export?collection=${encodeURIComponent(collection)}`);
+    if (!response.ok) {
+      let message = `HTTP ${response.status}`;
+      try {
+        const payload = await response.json();
+        message = payload.error || message;
+      } catch (_) {
+        message = await response.text() || message;
+      }
+      throw new Error(message);
+    }
+    const blob = await response.blob();
+    const link = document.createElement("a");
+    link.href = URL.createObjectURL(blob);
+    link.download = `${collection}-${isoStamp()}.xlsx`;
+    link.click();
+    URL.revokeObjectURL(link.href);
+    showStatus("明细 Excel 已导出。");
+  });
+}
+
+function arrayBufferToBase64(buffer) {
+  const bytes = new Uint8Array(buffer);
+  let binary = "";
+  for (let index = 0; index < bytes.length; index += 1) {
+    binary += String.fromCharCode(bytes[index]);
+  }
+  return btoa(binary);
+}
+
+async function importXlsx(event) {
+  const file = event.currentTarget.files && event.currentTarget.files[0];
+  if (!file) return;
+  const collection = selectedCsvCollection();
+  try {
+    if (!window.confirm("导入 Excel 会追加到所选类型的当前明细；系统会先全量校验，失败不会落盘。确认继续？")) return;
+    const data_b64 = arrayBufferToBase64(await file.arrayBuffer());
+    await runAction("正在导入明细 Excel...", async () => {
+      await api("/api/xlsx/import", { method: "POST", body: JSON.stringify({ collection, data_b64 }) });
+      await loadDashboard();
+      showStatus("明细 Excel 已导入。");
+    });
+  } catch (error) {
+    showStatus(`Excel 导入失败：${error.message}`, "error");
+  } finally {
+    event.currentTarget.value = "";
+  }
+}
+
+async function restoreLatestBackup() {
+  if (!window.confirm("恢复最近备份会覆盖当前工作区；系统会先自动备份当前数据。确认继续？")) return;
+  await runAction("正在恢复最近备份...", async () => {
+    await api("/api/backups/latest/restore", { method: "POST", body: "{}" });
+    await loadDashboard();
+    showStatus("最近备份已恢复。");
+  });
+}
+
+async function clearBusinessData() {
+  if (!window.confirm("清空会删除当前敞口、锁汇和结算记录；系统会先自动备份当前数据。确认继续？")) return;
+  await runAction("正在清空业务数据...", async () => {
+    await api("/api/clear-business", { method: "POST", body: "{}" });
+    await loadDashboard();
+    showStatus("业务数据已清空。");
+  });
+}
+
 function bindForms() {
   const exposureForm = document.getElementById("exposureForm");
+  bindDataManagement();
+  bindSetupPanel();
   // 顺序要紧：category 的处理必须先把 categoryTouched 置上再刷新提示。
   // 反过来注册的话，用户第一次改下拉框时 updateCategoryHint 先跑，
   // 那时 categoryTouched 还是 false，选择会被"跟随推荐"的逻辑弹回去——
@@ -937,7 +1323,7 @@ function bindForms() {
 
   document.getElementById("configForm").addEventListener("submit", async (event) => {
     event.preventDefault();
-    await submitForm(event.currentTarget, "/api/config", "配置已保存", null, false);
+    await submitForm(event.currentTarget, "/api/config", "配置已保存", null, false, configFormData);
   });
 
   document.getElementById("refreshRatesBtn").addEventListener("click", async () => {
@@ -949,7 +1335,7 @@ function bindForms() {
   });
 
   document.getElementById("resetDemoBtn").addEventListener("click", async () => {
-    if (!window.confirm("恢复样例会覆盖当前所有已录入的敞口、锁汇和到期汇率数据，且无法撤销。确认继续？")) return;
+    if (!window.confirm("恢复样例会覆盖当前敞口、锁汇、结算记录和配置参数；系统会先自动备份当前工作区。确认继续？")) return;
     await runAction("正在恢复样例...", async () => {
       await api("/api/reset-demo", { method: "POST", body: "{}" });
       await loadDashboard();
@@ -966,7 +1352,7 @@ function bindForms() {
   });
 }
 
-async function submitForm(form, path, successMessage, afterSuccess = null, reset = true) {
+async function submitForm(form, path, successMessage, afterSuccess = null, reset = true, payloadBuilder = formData) {
   if (!form.reportValidity()) {
     showStatus("有必填项没有填完整，请检查表单。", "error");
     return;
@@ -974,13 +1360,16 @@ async function submitForm(form, path, successMessage, afterSuccess = null, reset
   const button = form.querySelector('button[type="submit"]');
   await runAction("正在保存...", async () => {
     if (button) button.disabled = true;
-    await api(path, { method: "POST", body: JSON.stringify(formData(form)) });
+    const editId = form.dataset.editId;
+    const target = editId ? `${path}/${encodeURIComponent(editId)}` : path;
+    await api(target, { method: editId ? "PUT" : "POST", body: JSON.stringify(payloadBuilder(form)) });
     if (reset) {
       form.reset();
       setDefaultDates();
     }
+    if (editId) resetEdit(form);
     await loadDashboard();
-    showStatus(successMessage);
+    showStatus(editId ? "修改已保存" : successMessage);
     if (afterSuccess) afterSuccess();
     if (button) button.disabled = false;
   }, () => {
