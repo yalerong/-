@@ -321,9 +321,15 @@ function renderSuggestions(items) {
       <p class="meta">剩余敞口：${money(item.net_exposure)}，目标套保比例：${ratioLine}，损益科目：${bucketName(item.accounting_bucket)}</p>
       <p class="meta">建议金额：${money(item.recommended_amount)}，交易汇率：${item.trade_rate}${forwardTag(item)}，人民币风险：${money(item.risk_cny)}</p>
       ${forwardLine(item)}
-      <button type="button">按建议填入锁汇单</button>
+      ${item.past_due
+        ? '<p class="notice notice-warn">到期日已过，按今天的交易日已经下不了这张远期单：请到「结算明细」登记实际结果，或把敞口的到期日改到未来。</p><button type="button" disabled>按建议填入锁汇单</button>'
+        : '<button type="button">按建议填入锁汇单</button>'}
     `;
-    card.querySelector("button").addEventListener("click", () => fillHedgeFromSuggestion(item));
+    // 过期敞口预填出来的锁汇单 trade_date > due_date，后端必然拒绝，
+    // 按钮点了只会得到一个 400，不如直接禁用并指到结算流程。
+    if (!item.past_due) {
+      card.querySelector("button").addEventListener("click", () => fillHedgeFromSuggestion(item));
+    }
     box.appendChild(card);
   });
 }
@@ -628,6 +634,21 @@ function updateUndoButton() {
 function clearUndoState() {
   lastDeleted = null;
   updateUndoButton();
+}
+
+// 导入/恢复/清空/换样例之后，旧工作区的编辑态不能留着：替换后的工作区
+// 常常带着同样的稳定 ID（恢复备份、重载样例都是），此时提交一张陈旧的
+// 编辑表单会静默覆盖新工作区里的那条记录。
+function resetActiveEdits() {
+  for (const id of ["exposureForm", "hedgeForm", "settlementForm"]) {
+    const form = document.getElementById(id);
+    if (form && form.dataset.editId) resetEdit(form);
+  }
+}
+
+function afterWorkspaceReplaced() {
+  clearUndoState();
+  resetActiveEdits();
 }
 
 async function undoDeleted() {
@@ -1017,7 +1038,7 @@ function renderPlans(rows) {
         <td class="num">${ratioText(row.target_hedge_ratio)}</td>
         <td class="num">${Number(row.forecast_multiplier).toFixed(2)}×</td>
         <td class="num">${money(row.recommended_amount)}</td>
-        <td class="num">${row.trade_rate}</td>
+        <td class="num">${escapeHtml(row.trade_rate)}</td>
       </tr>
     `).join("");
     div.innerHTML = `
@@ -1109,7 +1130,7 @@ function bindSetupPanel() {
   if (empty) empty.addEventListener("click", async () => {
     await runAction("正在创建空白工作区...", async () => {
       await api("/api/workspace/empty", { method: "POST", body: "{}" });
-      clearUndoState();
+      afterWorkspaceReplaced();
       await loadDashboard();
       showStatus("空白工作区已就绪。");
     });
@@ -1117,7 +1138,7 @@ function bindSetupPanel() {
   if (sample) sample.addEventListener("click", async () => {
     await runAction("正在加载样例...", async () => {
       await api("/api/workspace/sample", { method: "POST", body: "{}" });
-      clearUndoState();
+      afterWorkspaceReplaced();
       await loadDashboard();
       showStatus("样例数据已加载。");
     });
@@ -1174,7 +1195,7 @@ async function importWorkspace(event) {
     if (!window.confirm("导入会覆盖当前工作区；系统会先自动备份当前数据。确认继续？")) return;
     await runAction("正在导入工作区...", async () => {
       await api("/api/import", { method: "POST", body: JSON.stringify(parsed) });
-      clearUndoState();
+      afterWorkspaceReplaced();
       await loadDashboard();
       showStatus("工作区已导入。");
     });
@@ -1284,7 +1305,7 @@ async function restoreLatestBackup() {
   if (!window.confirm("恢复最近备份会覆盖当前工作区；系统会先自动备份当前数据。确认继续？")) return;
   await runAction("正在恢复最近备份...", async () => {
     await api("/api/backups/latest/restore", { method: "POST", body: "{}" });
-    clearUndoState();
+    afterWorkspaceReplaced();
     await loadDashboard();
     showStatus("最近备份已恢复。");
   });
@@ -1294,7 +1315,7 @@ async function clearBusinessData() {
   if (!window.confirm("清空会删除当前敞口、锁汇和结算记录；系统会先自动备份当前数据。确认继续？")) return;
   await runAction("正在清空业务数据...", async () => {
     await api("/api/clear-business", { method: "POST", body: "{}" });
-    clearUndoState();
+    afterWorkspaceReplaced();
     await loadDashboard();
     showStatus("业务数据已清空。");
   });
@@ -1368,7 +1389,7 @@ function bindForms() {
     if (!window.confirm("恢复样例会覆盖当前敞口、锁汇、结算记录和配置参数；系统会先自动备份当前工作区。确认继续？")) return;
     await runAction("正在恢复样例...", async () => {
       await api("/api/reset-demo", { method: "POST", body: "{}" });
-      clearUndoState();
+      afterWorkspaceReplaced();
       await loadDashboard();
       showStatus("样例数据已恢复");
     });

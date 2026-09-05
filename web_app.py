@@ -10,6 +10,7 @@ import json
 import math
 import mimetypes
 import os
+import posixpath
 import re
 import threading
 import uuid
@@ -204,27 +205,39 @@ def backup_dir() -> Path:
     return DATA_DIR / "backups"
 
 
+def _stat_backups(directory: Path) -> list[tuple[Path, os.stat_result]]:
+    """备份文件按修改时间倒序，stat 失败的直接跳过。
+
+    列备份和别的请求剪枝备份是并发的：glob 到的文件在 stat 之前可能已经
+    被删掉。排序 key 里直接 stat 会把 FileNotFoundError 抛到整个请求外面。
+    """
+    entries = []
+    for path in directory.glob("*.json"):
+        try:
+            entries.append((path, path.stat()))
+        except OSError:
+            continue
+    entries.sort(key=lambda item: item[1].st_mtime, reverse=True)
+    return entries
+
+
 def list_backups() -> list[dict]:
     directory = backup_dir()
     if not directory.exists():
         return []
-    rows = []
-    for path in sorted(directory.glob("*.json"), key=lambda item: item.stat().st_mtime, reverse=True):
-        try:
-            rows.append({
-                "name": path.name,
-                "size": path.stat().st_size,
-                "created_at": datetime.fromtimestamp(path.stat().st_mtime, timezone.utc)
-                .replace(microsecond=0).isoformat().replace("+00:00", "Z"),
-            })
-        except OSError:
-            continue
-    return rows
+    return [
+        {
+            "name": path.name,
+            "size": stat.st_size,
+            "created_at": datetime.fromtimestamp(stat.st_mtime, timezone.utc)
+            .replace(microsecond=0).isoformat().replace("+00:00", "Z"),
+        }
+        for path, stat in _stat_backups(directory)
+    ]
 
 
 def prune_backups() -> None:
-    backups = sorted(backup_dir().glob("*.json"), key=lambda item: item.stat().st_mtime, reverse=True)
-    for path in backups[MAX_BACKUPS:]:
+    for path, _ in _stat_backups(backup_dir())[MAX_BACKUPS:]:
         try:
             path.unlink()
         except OSError:
@@ -247,10 +260,14 @@ def backup_current_state(reason: str) -> dict | None:
 
 
 def save_state(state: dict, reason: str = "state", backup: bool = True) -> None:
+    if isinstance(state.get("metadata"), dict):
+        state["metadata"]["updated_at"] = now_iso()
+    # 先校验、再轮换备份：端点级检查过了但整体校验不过的请求（比如配置里
+    # 删掉了仍有记录在用的币种）什么都没写，却会白吃一格备份槽位；
+    # 重复几次就把真正有用的回滚快照挤没了。
+    normalized = validate_workspace_state(state)
     if backup:
         backup_current_state(reason)
-    state.setdefault("metadata", {})["updated_at"] = now_iso()
-    normalized = validate_workspace_state(state)
     write_json(STATE_FILE, normalized)
     if backup:
         # 保存后的快照用于主文件损坏时恢复；用户主动“恢复最近备份”会跳过它，
@@ -374,6 +391,11 @@ def validate_config(payload: dict, base: dict | None = None, replace_maps: set[s
     if not isinstance(payload, dict):
         raise ValueError("配置必须是对象")
     config = merge_config(base or DEFAULT_CONFIG, payload, replace_maps=replace_maps)
+    # 全站汇率都按「1 外币 = N 元人民币」记，远期定价拿 base_currency 去查
+    # 利率。导入的工作区把它改成别的币种，远期价就静默用错利率。
+    if config.get("base_currency", BASE_CURRENCY) != BASE_CURRENCY:
+        raise ValueError(f"base_currency 只支持 {BASE_CURRENCY}")
+    config["base_currency"] = BASE_CURRENCY
     currencies = config.get("supported_currencies")
     if not isinstance(currencies, list) or not currencies:
         raise ValueError("supported_currencies 必须是非空列表")
@@ -452,16 +474,12 @@ def validate_config(payload: dict, base: dict | None = None, replace_maps: set[s
 
 
 def latest_backup_file() -> Path | None:
-    rows = sorted(backup_dir().glob("*.json"), key=lambda item: item.stat().st_mtime, reverse=True)
-    return rows[0] if rows else None
+    rows = _stat_backups(backup_dir())
+    return rows[0][0] if rows else None
 
 
 def latest_undo_backup_file() -> Path | None:
-    rows = sorted(
-        (path for path in backup_dir().glob("*.json") if "-after-" not in path.name),
-        key=lambda item: item.stat().st_mtime,
-        reverse=True,
-    )
+    rows = [path for path, _ in _stat_backups(backup_dir()) if "-after-" not in path.name]
     return rows[0] if rows else None
 
 
@@ -510,6 +528,8 @@ def validate_workspace_state(state: dict) -> dict:
     if not isinstance(state, dict):
         raise ValueError("工作区数据必须是对象")
     normalized = copy.deepcopy(state)
+    if not isinstance(normalized.get("metadata", {}), dict):
+        raise ValueError("metadata 必须是对象")
     normalized.setdefault("metadata", {})
     normalized["metadata"].setdefault("setup_complete", True)
     normalized["metadata"].setdefault("data_mode", "imported")
@@ -1569,14 +1589,40 @@ def validate_for_collection(collection: str, row: dict, config: dict | None = No
     raise ValueError("unknown collection")
 
 
+# 方案是 plans.freeze 冻出来的决策快照，前端会把这些字段直接渲染进表格。
+# 导入的 JSON 可以被人手改过，所以每个会渲染的字段都要卡住类型：
+# 数字字段只能是数字，文本字段只能是字符串，否则一段 HTML 就能存进去。
+PLAN_TEXT_FIELDS = ("id", "label", "created_at")
+PLAN_ROW_TEXT_FIELDS = ("period", "action", "forecast_reason", "forward_basis", "accounting_bucket")
+PLAN_ROW_NUMBER_FIELDS = (
+    "business_exposure", "covered_exposure", "net_exposure", "target_hedge_ratio",
+    "forecast_multiplier", "effective_hedge_ratio", "recommended_amount", "spot_rate", "trade_rate",
+)
+
+
+def _optional_text(value: object, field: str) -> None:
+    if value is not None and not isinstance(value, str):
+        raise ValueError(f"{field} 必须是字符串")
+
+
+def _optional_finite(value: object, field: str) -> None:
+    if value is None:
+        return
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value):
+        raise ValueError(f"{field} 必须是数字")
+
+
 def validate_plan_snapshot(row: object) -> None:
     if not isinstance(row, dict):
         raise ValueError("plans 中的每份方案必须是对象")
+    for field in PLAN_TEXT_FIELDS:
+        _optional_text(row.get(field), f"方案 {field}")
     if "config" in row and not isinstance(row.get("config"), dict):
         raise ValueError("方案 config 必须是对象")
     if "rate_snapshot" in row and not isinstance(row.get("rate_snapshot"), dict):
         raise ValueError("方案 rate_snapshot 必须是对象")
     rate_snapshot = row.get("rate_snapshot") or {}
+    _optional_text(rate_snapshot.get("status"), "方案 rate_snapshot.status")
     if not isinstance(rate_snapshot.get("pair_rates", {}), dict):
         raise ValueError("方案 pair_rates 必须是对象")
     for currency, value in rate_snapshot.get("pair_rates", {}).items():
@@ -1591,6 +1637,10 @@ def validate_plan_snapshot(row: object) -> None:
             raise ValueError("方案 rows 只能包含对象")
         if not isinstance(item.get("currency"), str):
             raise ValueError("方案 rows.currency 必须是字符串")
+        for field in PLAN_ROW_TEXT_FIELDS:
+            _optional_text(item.get(field), f"方案 rows.{field}")
+        for field in PLAN_ROW_NUMBER_FIELDS:
+            _optional_finite(item.get(field), f"方案 rows.{field}")
 
 
 def same_origin(handler: BaseHTTPRequestHandler, value: str) -> bool:
@@ -1786,17 +1836,46 @@ def xlsx_cell_value(cell: ET.Element, shared_strings: list[str]) -> str:
     return value.text
 
 
+def xlsx_first_sheet_part(book: zipfile.ZipFile) -> str:
+    """顺着 workbook.xml → workbook.xml.rels 找第一张工作表的实际部件名。
+
+    工作簿删过表之后剩下的可能叫 sheet2.xml，写死 sheet1.xml 会把合法文件拒掉。
+    没有工作簿部件的退化包才回退到 sheet1.xml。
+    """
+    names = set(book.namelist())
+    if "xl/workbook.xml" not in names or "xl/_rels/workbook.xml.rels" not in names:
+        if "xl/worksheets/sheet1.xml" in names:
+            return "xl/worksheets/sheet1.xml"
+        raise ValueError("XLSX 缺少 xl/workbook.xml，找不到工作表")
+    workbook = ET.fromstring(book.read("xl/workbook.xml"))
+    sheet = workbook.find(".//x:sheets/x:sheet", {"x": XLSX_MAIN_NS})
+    if sheet is None:
+        raise ValueError("XLSX 工作簿里没有工作表")
+    rel_id = sheet.attrib.get(f"{{{XLSX_REL_NS}}}id")
+    rels = ET.fromstring(book.read("xl/_rels/workbook.xml.rels"))
+    target = next(
+        (rel.attrib.get("Target") for rel in rels.findall("r:Relationship", {"r": XLSX_PKG_REL_NS})
+         if rel.attrib.get("Id") == rel_id),
+        None,
+    )
+    if not target:
+        raise ValueError("XLSX 工作簿关系里找不到第一张工作表")
+    part = target.lstrip("/") if target.startswith("/") else posixpath.normpath(posixpath.join("xl", target))
+    if part not in names:
+        raise ValueError(f"XLSX 缺少工作表部件 {part}")
+    return part
+
+
 def read_xlsx_rows(data: bytes) -> list[list[str]]:
     ns = {"x": XLSX_MAIN_NS}
     try:
         with zipfile.ZipFile(io.BytesIO(data)) as book:
-            if "xl/worksheets/sheet1.xml" not in book.namelist():
-                raise ValueError("XLSX 缺少 xl/worksheets/sheet1.xml")
+            sheet_part = xlsx_first_sheet_part(book)
             shared_strings: list[str] = []
             if "xl/sharedStrings.xml" in book.namelist():
                 shared_root = ET.fromstring(book.read("xl/sharedStrings.xml"))
                 shared_strings = ["".join(item.itertext()) for item in shared_root.findall("x:si", ns)]
-            root = ET.fromstring(book.read("xl/worksheets/sheet1.xml"))
+            root = ET.fromstring(book.read(sheet_part))
     except zipfile.BadZipFile:
         raise ValueError("XLSX 文件不是有效的 zip 工作簿") from None
     except ET.ParseError:

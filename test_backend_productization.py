@@ -330,6 +330,94 @@ class BackendProductizationTest(unittest.TestCase):
                 with self.assertRaises(ValueError):
                     web_app.validate_workspace_state(state)
 
+    def test_workspace_validation_rejects_unsafe_plan_field_types(self):
+        clean_row = {
+            "period": "2027-03", "currency": "USD", "action": "sell_foreign",
+            "target_hedge_ratio": 0.5, "forecast_multiplier": 1.0,
+            "recommended_amount": 100.0, "trade_rate": 7.123456, "forecast_reason": None,
+        }
+        clean = {"id": "p1", "label": "ok", "created_at": "2026-01-01T00:00:00Z",
+                 "rate_snapshot": {"status": "test", "pair_rates": {"USD": 7.2}}, "rows": [clean_row]}
+        web_app.validate_plan_snapshot(clean)
+
+        malformed = [
+            {"label": ["<img src=x onerror=alert(1)>"]},
+            {"created_at": 123},
+            {"rate_snapshot": {"status": {"x": 1}}},
+            {"rows": [{**clean_row, "trade_rate": "<img src=x onerror=alert(1)>"}]},
+            {"rows": [{**clean_row, "recommended_amount": "100"}]},
+            {"rows": [{**clean_row, "forecast_multiplier": True}]},
+            {"rows": [{**clean_row, "target_hedge_ratio": float("nan")}]},
+            {"rows": [{**clean_row, "period": ["2027-03"]}]},
+        ]
+        for plan in malformed:
+            with self.subTest(plan=plan):
+                with self.assertRaises(ValueError):
+                    web_app.validate_plan_snapshot(plan)
+
+        state = web_app.empty_state(setup_complete=True)
+        state["plans"] = [{**clean, "rows": [{**clean_row, "trade_rate": "<img src=x onerror=alert(1)>"}]}]
+        status, body, _ = http_json("POST", f"{self.base}/api/workspace/import", {"workspace": state})
+        self.assertEqual(status, 400)
+        self.assertIn("trade_rate", body["error"])
+
+    def test_workspace_import_rejects_non_object_metadata(self):
+        for metadata in (None, [], "sample"):
+            with self.subTest(metadata=metadata):
+                state = web_app.empty_state(setup_complete=True)
+                state["metadata"] = metadata
+                status, body, _ = http_json("POST", f"{self.base}/api/workspace/import", {"workspace": state})
+                self.assertEqual(status, 400)
+                self.assertIn("metadata", body["error"])
+
+    def test_workspace_import_requires_cny_base_currency(self):
+        for base_currency in ("USD", {"code": "CNY"}, ["CNY"]):
+            with self.subTest(base_currency=base_currency):
+                state = web_app.empty_state(setup_complete=True)
+                state["config"]["base_currency"] = base_currency
+                status, body, _ = http_json("POST", f"{self.base}/api/workspace/import", {"workspace": state})
+                self.assertEqual(status, 400)
+                self.assertIn("base_currency", body["error"])
+        status, data, _ = http_json("GET", f"{self.base}/api/state")
+        self.assertEqual(status, 200)
+        self.assertEqual(data["config"]["base_currency"], "CNY")
+
+    def test_rejected_mutation_does_not_rotate_backups(self):
+        before = [row["name"] for row in web_app.list_backups()]
+        self.assertTrue(before)
+
+        # 端点级校验放过（合法的币种列表），整体校验才发现样例记录仍在用 USD
+        status, body, _ = http_json("POST", f"{self.base}/api/config", {"supported_currencies": ["JPY"]})
+
+        self.assertEqual(status, 400)
+        self.assertIn("USD", body["error"])
+        self.assertEqual([row["name"] for row in web_app.list_backups()], before)
+        _, data, _ = http_json("GET", f"{self.base}/api/state")
+        self.assertIn("USD", data["config"]["supported_currencies"])
+
+    def test_backup_listing_tolerates_files_deleted_mid_scan(self):
+        directory = web_app.backup_dir()
+        directory.mkdir(parents=True, exist_ok=True)
+        doomed = directory / "20990101T000000Z-doomed-deadbeef.json"
+        doomed.write_text("{}", encoding="utf-8")
+        original_stat = Path.stat
+
+        def racing_stat(self, *args, **kwargs):
+            if self.name == doomed.name:
+                raise FileNotFoundError(str(self))
+            return original_stat(self, *args, **kwargs)
+
+        with mock.patch.object(Path, "stat", racing_stat):
+            names = [row["name"] for row in web_app.list_backups()]
+            latest = web_app.latest_backup_file()
+            undo = web_app.latest_undo_backup_file()
+            web_app.prune_backups()
+
+        self.assertNotIn(doomed.name, names)
+        self.assertNotEqual(latest, doomed)
+        self.assertNotEqual(undo, doomed)
+        doomed.unlink()
+
     def test_workspace_reads_preserve_updated_at_metadata(self):
         fixed = "2026-01-02T03:04:05Z"
         state = web_app.empty_state(setup_complete=True)
@@ -563,6 +651,55 @@ class BackendProductizationTest(unittest.TestCase):
         self.assertEqual(body["imported"], 1)
         _, after, _ = http_json("GET", f"{self.base}/api/state")
         self.assertEqual(after["exposures"][0]["description"], "excel row")
+
+    def test_xlsx_import_resolves_worksheet_through_workbook_relationships(self):
+        status, _, _ = http_json("POST", f"{self.base}/api/workspace/empty", {})
+        self.assertEqual(status, 200)
+        status, _, _ = http_json("POST", f"{self.base}/api/exposures", {
+            "due_date": "2027-09-30", "currency": "USD", "amount": 12, "direction": "receipt",
+            "category": "cash_flow", "description": "second sheet",
+        })
+        self.assertEqual(status, 200)
+        status, blob, _ = http_bytes("GET", f"{self.base}/api/xlsx/export?collection=exposures")
+        self.assertEqual(status, 200)
+
+        # 模拟删过第一张表的工作簿：唯一的工作表叫 sheet2.xml，只有 rels 指向它
+        renamed = io.BytesIO()
+        with zipfile.ZipFile(io.BytesIO(blob)) as source, zipfile.ZipFile(renamed, "w") as target:
+            for name in source.namelist():
+                data = source.read(name)
+                if name == "xl/worksheets/sheet1.xml":
+                    name = "xl/worksheets/sheet2.xml"
+                elif name in {"xl/_rels/workbook.xml.rels", "[Content_Types].xml"}:
+                    data = data.replace(b"sheet1.xml", b"sheet2.xml")
+                target.writestr(name, data)
+
+        status, _, _ = http_json("POST", f"{self.base}/api/workspace/empty", {})
+        self.assertEqual(status, 200)
+        status, body, _ = http_json("POST", f"{self.base}/api/xlsx/import", {
+            "collection": "exposures",
+            "data_b64": base64.b64encode(renamed.getvalue()).decode("ascii"),
+        })
+
+        self.assertEqual(status, 200)
+        self.assertEqual(body["imported"], 1)
+        _, after, _ = http_json("GET", f"{self.base}/api/state")
+        self.assertEqual(after["exposures"][0]["description"], "second sheet")
+
+        # 关系表指向一个不存在的部件，要报 400 而不是 500
+        broken = io.BytesIO()
+        with zipfile.ZipFile(io.BytesIO(blob)) as source, zipfile.ZipFile(broken, "w") as target:
+            for name in source.namelist():
+                data = source.read(name)
+                if name == "xl/_rels/workbook.xml.rels":
+                    data = data.replace(b"sheet1.xml", b"sheet9.xml")
+                target.writestr(name, data)
+        status, body, _ = http_json("POST", f"{self.base}/api/xlsx/import", {
+            "collection": "exposures",
+            "data_b64": base64.b64encode(broken.getvalue()).decode("ascii"),
+        })
+        self.assertEqual(status, 400)
+        self.assertIn("sheet9.xml", body["error"])
 
 
 if __name__ == "__main__":

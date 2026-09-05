@@ -81,6 +81,17 @@ class StaticBuildTest(unittest.TestCase):
         self.assertIn("form.reset();", source_js)
         self.assertIn("clearUndoState();", source_js)
         self.assertIn("lastDeleted = null;", source_js)
+        # 换工作区后同时清掉编辑态，否则陈旧表单会覆盖新工作区里同 ID 的记录
+        self.assertIn("resetActiveEdits();", source_js)
+        self.assertEqual(source_js.count("afterWorkspaceReplaced();"), 6)
+
+    def test_frontend_escapes_stored_plan_fields_and_disables_past_due_actions(self):
+        source_js = (self.out / "web" / "app.js").read_text(encoding="utf-8")
+
+        self.assertIn("${escapeHtml(row.trade_rate)}", source_js)
+        self.assertNotIn("${row.trade_rate}", source_js)
+        self.assertIn('<button type="button" disabled>按建议填入锁汇单</button>', source_js)
+        self.assertIn("if (!item.past_due)", source_js)
 
     def test_config_form_exposes_provisional_confirmation_flags(self):
         self.assertIn('name="confirmed_parameters"', self.html)
