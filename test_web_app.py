@@ -97,6 +97,45 @@ class WebAppLogicTest(unittest.TestCase):
             any("还没录入到期实际汇率" in line for line in dashboard["plain_language"])
         )
 
+    def test_settled_backtest_survives_missing_market_rate(self):
+        state = copy.deepcopy(web_app.DEMO_STATE)
+        state["config"] = dict(web_app.DEFAULT_CONFIG, supported_currencies=["USD", "CHF"])
+        state["exposures"] = [{
+            "id": "chf-exp",
+            "due_date": "2026-06-30",
+            "currency": "CHF",
+            "amount": 100000,
+            "direction": "receipt",
+            "category": "cash_flow",
+            "probability": 1,
+        }]
+        state["hedges"] = [{
+            "id": "chf-hedge",
+            "trade_date": "2026-05-01",
+            "due_date": "2026-06-30",
+            "currency": "CHF",
+            "amount": 50000,
+            "action": "sell_foreign",
+            "locked_rate": 8.1,
+        }]
+        state["settlements"] = [{
+            "id": "chf-settle",
+            "due_date": "2026-06-30",
+            "currency": "CHF",
+            "actual_rate": 8.2,
+        }]
+
+        dashboard = web_app.build_dashboard(
+            state,
+            {"source": "test", "status": "test", "fetched_at": "x", "pair_rates": {"USD": 7.2}},
+            forecast_doc={},
+        )
+
+        chf = next(row for row in dashboard["backtest"] if row["currency"] == "CHF")
+        self.assertTrue(chf["settled"])
+        self.assertEqual(chf["actual_rate"], 8.2)
+        self.assertIsNone(chf["reference_rate"])
+
     def test_scenario_totals_sum_every_currency_and_period(self):
         dashboard = web_app.build_dashboard(web_app.DEMO_STATE, self.rates, forecast_doc={})
         totals = dashboard["scenario_totals"]

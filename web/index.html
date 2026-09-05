@@ -361,6 +361,13 @@
             <label>分月分币种套保比例 JSON（0–1） <textarea name="month_currency_hedge_ratios" rows="4" data-json-field placeholder='{"2027-03":{"USD":0.75}}'></textarea></label>
             <label>分币种场景 JSON（小数，-0.01 = -1%） <textarea name="scenario_shifts" rows="4" data-json-field placeholder='{"EUR":{"optimistic":-0.01}}'></textarea></label>
             <label>财务月均汇率 JSON <textarea name="monthly_average_rates" rows="4" data-json-field placeholder='{"2027-03:USD":7.12}'></textarea></label>
+            <fieldset>
+              <legend>已人工核对的参数</legend>
+              <p class="notice">只有确实向行情源、银行或财务负责人核对过后再勾选；未勾选的建议会继续标为试算。</p>
+              <label class="checkbox-label"><input name="confirmed_parameters" value="rates" type="checkbox" data-confirmed-key="rates" /> 当前即期汇率已核对</label>
+              <label class="checkbox-label"><input name="confirmed_parameters" value="interest_rates" type="checkbox" data-confirmed-key="interest_rates" /> 资金利率已核对</label>
+              <label class="checkbox-label"><input name="confirmed_parameters" value="scenario_shifts" type="checkbox" data-confirmed-key="scenario_shifts" /> 情景假设已核对</label>
+            </fieldset>
             <p id="configJsonError" class="notice notice-warn" role="alert"></p>
             <button type="submit">保存配置</button>
           </form>

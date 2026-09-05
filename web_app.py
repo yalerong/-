@@ -249,7 +249,9 @@ def backup_current_state(reason: str) -> dict | None:
 def save_state(state: dict, reason: str = "state", backup: bool = True) -> None:
     if backup:
         backup_current_state(reason)
-    write_json(STATE_FILE, validate_workspace_state(state))
+    state.setdefault("metadata", {})["updated_at"] = now_iso()
+    normalized = validate_workspace_state(state)
+    write_json(STATE_FILE, normalized)
     if backup:
         # 保存后的快照用于主文件损坏时恢复；用户主动“恢复最近备份”会跳过它，
         # 选择最近一次操作前的快照，见 latest_undo_backup_file。
@@ -353,10 +355,13 @@ def validate_currency(row: dict, config: dict) -> str:
     return currency
 
 
-def merge_config(base: dict, patch: dict) -> dict:
+def merge_config(base: dict, patch: dict, replace_maps: set[str] | None = None) -> dict:
     merged = copy.deepcopy(base)
+    replace_maps = replace_maps or set()
     for key, value in (patch or {}).items():
-        if isinstance(value, dict) and isinstance(merged.get(key), dict):
+        if key in replace_maps:
+            merged[key] = copy.deepcopy(value)
+        elif isinstance(value, dict) and isinstance(merged.get(key), dict):
             nested = copy.deepcopy(merged[key])
             nested.update(value)
             merged[key] = nested
@@ -365,10 +370,10 @@ def merge_config(base: dict, patch: dict) -> dict:
     return merged
 
 
-def validate_config(payload: dict, base: dict | None = None) -> dict:
+def validate_config(payload: dict, base: dict | None = None, replace_maps: set[str] | None = None) -> dict:
     if not isinstance(payload, dict):
         raise ValueError("配置必须是对象")
-    config = merge_config(base or DEFAULT_CONFIG, payload)
+    config = merge_config(base or DEFAULT_CONFIG, payload, replace_maps=replace_maps)
     currencies = config.get("supported_currencies")
     if not isinstance(currencies, list) or not currencies:
         raise ValueError("supported_currencies 必须是非空列表")
@@ -509,19 +514,24 @@ def validate_workspace_state(state: dict) -> dict:
     normalized["metadata"].setdefault("setup_complete", True)
     normalized["metadata"].setdefault("data_mode", "imported")
     normalized["metadata"].setdefault("created_at", now_iso())
-    normalized["metadata"]["updated_at"] = now_iso()
+    normalized["metadata"].setdefault("updated_at", normalized["metadata"]["created_at"])
     normalized["config"] = validate_config(normalized.get("config", {}), base=DEFAULT_CONFIG)
     for key in ("exposures", "hedges", "settlements", "plans"):
         value = normalized.get(key, [])
         if not isinstance(value, list):
             raise ValueError(f"{key} 必须是列表")
         normalized[key] = value
+    for key in ("exposures", "hedges", "settlements"):
+        if any(not isinstance(row, dict) for row in normalized[key]):
+            raise ValueError(f"{key} 只能包含对象")
     for row in normalized["exposures"]:
-        validate_exposure(row, normalized["config"])
+        validate_exposure(row, normalized["config"], allow_legacy_category=True)
     for row in normalized["hedges"]:
         validate_hedge(row, normalized["config"])
     for row in normalized["settlements"]:
         validate_settlement(row, normalized["config"])
+    for row in normalized["plans"]:
+        validate_plan_snapshot(row)
     return normalized
 
 
@@ -552,6 +562,23 @@ def append_audit(action: str, collection: str, record_id: str | None, before: di
 # 只读文件尾部这么多字节。日志只追加不截断，每次刷新面板都整份读一遍的话，
 # 开销会随历史线性增长；reset 那种条目还会带整个工作区快照，放大得更快。
 AUDIT_TAIL_BYTES = 256 * 1024
+AUDIT_SCAN_CHUNK_BYTES = 64 * 1024
+
+
+def _audit_tail_start(handle, size: int) -> int:
+    start = max(0, size - AUDIT_TAIL_BYTES)
+    if start == 0:
+        return 0
+    pos = start
+    while pos > 0:
+        block_start = max(0, pos - AUDIT_SCAN_CHUNK_BYTES)
+        handle.seek(block_start)
+        block = handle.read(pos - block_start)
+        newline = block.rfind(b"\n")
+        if newline >= 0:
+            return block_start + newline + 1
+        pos = block_start
+    return 0
 
 
 def read_audit(limit: int = 50) -> list[dict]:
@@ -561,13 +588,13 @@ def read_audit(limit: int = 50) -> list[dict]:
         with AUDIT_LOG_FILE.open("rb") as handle:
             handle.seek(0, 2)
             size = handle.tell()
-            start = max(0, size - AUDIT_TAIL_BYTES)
+            start = _audit_tail_start(handle, size)
             handle.seek(start)
             chunk = handle.read()
     except OSError:
         return []
 
-    rows = _parse_audit_lines(chunk.decode("utf-8", errors="ignore"), truncated=start > 0, limit=limit)
+    rows = _parse_audit_lines(chunk.decode("utf-8", errors="ignore"), truncated=False, limit=limit)
     if not rows and start > 0:
         # 单条记录就可能超过尾部窗口（reset 会把整个工作区连同全部方案
         # 快照塞进 before/after）。这时尾部里一条完整记录都没有，
@@ -1419,13 +1446,14 @@ def build_backtest(
                 "benchmark": benchmark,
                 "business_exposure": f2(gross),
                 "actual_rate": fN(actual_rate, 6),
-                "reference_rate": fN(market_rate, 6),
+                "reference_rate": None if market_rate is None else fN(market_rate, 6),
                 "settled": settled,
                 "rate_basis": "settlement" if settled else "market_estimate",
                 "hedge_effect_cny": f2(hedge_effect),
                 "locked_detail": locked_detail,
                 "plain_text": (
-                    f"{period} {currency}: 实际汇率 {actual_rate:.6f}，参考汇率 {market_rate:.6f}，"
+                    f"{period} {currency}: 实际汇率 {actual_rate:.6f}，"
+                    f"{'当前市场参考汇率缺失' if market_rate is None else f'参考汇率 {market_rate:.6f}'}，"
                     f"锁汇贡献 {hedge_effect:,.2f} CNY。"
                     if settled
                     else f"{period} {currency}: 尚未录入到期实际汇率，暂按当前市场价 {market_rate:.6f} 试算，"
@@ -1505,8 +1533,11 @@ def parse_body(handler: BaseHTTPRequestHandler) -> dict:
     return json.loads(raw) if raw else {}
 
 
-def add_id(row: dict) -> dict:
+def add_id(row: dict, preserve_existing: bool = True) -> dict:
     row = dict(row)
+    if not preserve_existing:
+        row.pop("id", None)
+        row.pop("created_at", None)
     row["id"] = row.get("id") or uuid.uuid4().hex[:12]
     row["created_at"] = row.get("created_at") or now_iso()
     if "currency" in row:
@@ -1536,6 +1567,30 @@ def validate_for_collection(collection: str, row: dict, config: dict | None = No
     if collection == "plans":
         return
     raise ValueError("unknown collection")
+
+
+def validate_plan_snapshot(row: object) -> None:
+    if not isinstance(row, dict):
+        raise ValueError("plans 中的每份方案必须是对象")
+    if "config" in row and not isinstance(row.get("config"), dict):
+        raise ValueError("方案 config 必须是对象")
+    if "rate_snapshot" in row and not isinstance(row.get("rate_snapshot"), dict):
+        raise ValueError("方案 rate_snapshot 必须是对象")
+    rate_snapshot = row.get("rate_snapshot") or {}
+    if not isinstance(rate_snapshot.get("pair_rates", {}), dict):
+        raise ValueError("方案 pair_rates 必须是对象")
+    for currency, value in rate_snapshot.get("pair_rates", {}).items():
+        validate_currency_code(currency, "方案 pair_rates")
+        if finite_number(value, f"方案 pair_rates.{currency}") == 0:
+            raise ValueError(f"方案 pair_rates.{currency} 不能为 0")
+    rows = row.get("rows", [])
+    if not isinstance(rows, list):
+        raise ValueError("方案 rows 必须是列表")
+    for item in rows:
+        if not isinstance(item, dict):
+            raise ValueError("方案 rows 只能包含对象")
+        if not isinstance(item.get("currency"), str):
+            raise ValueError("方案 rows.currency 必须是字符串")
 
 
 def same_origin(handler: BaseHTTPRequestHandler, value: str) -> bool:
@@ -1631,7 +1686,7 @@ def parse_collection_csv(collection: str, text: str, config: dict) -> list[dict]
             validate_for_collection(collection, row, config)
         except ValueError as exc:
             raise ValueError(f"第 {line_no} 行校验失败: {exc}") from None
-        rows.append(add_id(row))
+        rows.append(add_id(row, preserve_existing=False))
     if not rows:
         raise ValueError("CSV 没有可导入的数据行")
     return rows
@@ -1873,7 +1928,15 @@ class FxRiskHandler(BaseHTTPRequestHandler):
                     return
                 if self.path == "/api/config":
                     before = merged_config(state)
-                    merged = validate_config(body, base=before)
+                    replace_maps = {
+                        key for key in (
+                            "interest_rates", "forward_overrides", "scenario_shifts",
+                            "month_currency_hedge_ratios", "monthly_average_rates",
+                            "confirmed_parameters",
+                        )
+                        if key in body
+                    }
+                    merged = validate_config(body, base=before, replace_maps=replace_maps)
                     state["config"] = merged
                     save_state(state, reason="update-config")
                     changed = {
@@ -2118,7 +2181,7 @@ class FxRiskHandler(BaseHTTPRequestHandler):
         print(f"[{now_iso()}] {self.address_string()} {fmt % args}")
 
 
-def validate_exposure(row: dict, config: dict | None = None) -> None:
+def validate_exposure(row: dict, config: dict | None = None, allow_legacy_category: bool = False) -> None:
     required = ["due_date", "currency", "amount", "direction"]
     missing = [key for key in required if not row.get(key)]
     if missing:
@@ -2129,7 +2192,7 @@ def validate_exposure(row: dict, config: dict | None = None) -> None:
         raise ValueError("敞口方向必须是 receipt 或 payment")
     row["amount"] = positive_number(row["amount"], "amount")
     category = row.get("category") or DEFAULT_CATEGORY
-    if not known_category(category):
+    if not known_category(category) and not allow_legacy_category:
         raise ValueError("风险类型必须是 " + "/".join(EXPOSURE_CATEGORIES))
     row["category"] = category
     raw_probability = row.get("probability")

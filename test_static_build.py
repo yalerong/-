@@ -64,6 +64,27 @@ class StaticBuildTest(unittest.TestCase):
             self.assertIn(key, baked, f"烘进去的数据缺 {key}")
         self.assertTrue(baked["suggestions"], "演示数据要有待锁汇建议，否则页面空一块")
 
+    def test_baked_demo_workspace_is_marked_initialized(self):
+        match = re.search(BAKED_RE, self.html, re.S)
+        baked = json.loads(match.group(1))
+
+        self.assertEqual(baked["workspace"]["data_mode"], "sample")
+        self.assertTrue(baked["workspace"]["setup_complete"])
+
+    def test_static_csv_export_uses_displayed_rows(self):
+        self.assertIn("BAKED.exposures", self.html)
+        self.assertNotIn("static-demo,,,,", self.html)
+
+    def test_frontend_resets_stale_edit_and_undo_state(self):
+        source_js = (self.out / "web" / "app.js").read_text(encoding="utf-8")
+
+        self.assertIn("form.reset();", source_js)
+        self.assertIn("clearUndoState();", source_js)
+        self.assertIn("lastDeleted = null;", source_js)
+
+    def test_config_form_exposes_provisional_confirmation_flags(self):
+        self.assertIn('name="confirmed_parameters"', self.html)
+
     def test_demo_data_shows_the_things_worth_showing(self):
         match = re.search(BAKED_RE, self.html, re.S)
         baked = json.loads(match.group(1))

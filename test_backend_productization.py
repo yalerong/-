@@ -275,23 +275,92 @@ class BackendProductizationTest(unittest.TestCase):
         self.assertEqual(status, 400)
         self.assertIn("汇率", body["error"])
 
-    def test_config_deep_merges_nested_maps(self):
+    def test_config_replaces_submitted_json_maps(self):
         status, body, _ = http_json("POST", f"{self.base}/api/config", {
             "interest_rates": {"USD": 0.05},
             "scenario_shifts": {"USD": {"optimistic": 0.02}},
+            "forward_overrides": {"2027-03:USD": 7.08},
         })
         self.assertEqual(status, 200)
-        self.assertIn("EUR", body["config"]["interest_rates"])
+        self.assertNotIn("EUR", body["config"]["interest_rates"])
 
         status, body, _ = http_json("POST", f"{self.base}/api/config", {
             "interest_rates": {"EUR": 0.03},
             "scenario_shifts": {"EUR": {"pessimistic": -0.02}},
+            "forward_overrides": {},
         })
 
         self.assertEqual(status, 200)
-        self.assertEqual(body["config"]["interest_rates"]["USD"], 0.05)
+        self.assertNotIn("USD", body["config"]["interest_rates"])
         self.assertEqual(body["config"]["interest_rates"]["EUR"], 0.03)
-        self.assertIn("USD", body["config"]["scenario_shifts"])
+        self.assertNotIn("USD", body["config"]["scenario_shifts"])
+        self.assertEqual(body["config"]["forward_overrides"], {})
+
+    def test_csv_import_regenerates_exported_ids_before_append(self):
+        status, csv_text, _ = http_text("GET", f"{self.base}/api/csv/export?collection=exposures")
+        self.assertEqual(status, 200)
+
+        status, body, _ = http_json("POST", f"{self.base}/api/csv/import", {
+            "collection": "exposures",
+            "csv": csv_text,
+        })
+        self.assertEqual(status, 200)
+        self.assertGreater(body["imported"], 0)
+
+        status, data, _ = http_json("GET", f"{self.base}/api/state")
+        self.assertEqual(status, 200)
+        ids = [row["id"] for row in data["exposures"]]
+        self.assertEqual(len(ids), len(set(ids)))
+
+    def test_workspace_validation_rejects_malformed_plan_snapshots(self):
+        malformed = [
+            "not a plan",
+            {"config": []},
+            {"rate_snapshot": []},
+            {"rate_snapshot": {"pair_rates": []}},
+            {"rate_snapshot": {"pair_rates": {"USD": "bad"}}},
+            {"rows": "not rows"},
+            {"rows": ["not a row"]},
+            {"rows": [{"currency": []}]},
+        ]
+        for plan in malformed:
+            with self.subTest(plan=plan):
+                state = web_app.empty_state(setup_complete=True)
+                state["plans"] = [plan]
+                with self.assertRaises(ValueError):
+                    web_app.validate_workspace_state(state)
+
+    def test_workspace_reads_preserve_updated_at_metadata(self):
+        fixed = "2026-01-02T03:04:05Z"
+        state = web_app.empty_state(setup_complete=True)
+        state["metadata"]["updated_at"] = fixed
+        web_app.STATE_FILE.write_text(json.dumps(state, ensure_ascii=False), encoding="utf-8")
+
+        loaded = web_app.ensure_state()
+        self.assertEqual(loaded["metadata"]["updated_at"], fixed)
+
+        status, exported, _ = http_json("GET", f"{self.base}/api/workspace/export")
+        self.assertEqual(status, 200)
+        self.assertEqual(exported["metadata"]["updated_at"], fixed)
+
+    def test_workspace_load_preserves_legacy_exposure_categories(self):
+        state = web_app.empty_state(setup_complete=True)
+        legacy = {
+            "id": "legacy-1",
+            "due_date": "2027-05-31",
+            "currency": "USD",
+            "amount": 1000,
+            "direction": "receipt",
+            "category": "export_order",
+            "probability": 1,
+        }
+        state["exposures"] = [legacy]
+
+        normalized = web_app.validate_workspace_state(state)
+
+        self.assertEqual(normalized["exposures"][0]["category"], "export_order")
+        with self.assertRaises(ValueError):
+            web_app.validate_exposure(dict(legacy), normalized["config"])
 
     def test_corrupt_state_file_is_preserved_during_backup_recovery(self):
         state = web_app.empty_state()

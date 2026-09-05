@@ -121,7 +121,12 @@ function parseConfigJsonFields(form) {
 }
 
 function configFormData(form) {
-  return { ...formData(form), ...parseConfigJsonFields(form) };
+  const data = { ...formData(form), ...parseConfigJsonFields(form) };
+  data.confirmed_parameters = Object.fromEntries(
+    Array.from(form.querySelectorAll("[data-confirmed-key]"))
+      .map((field) => [field.dataset.confirmedKey, field.checked]),
+  );
+  return data;
 }
 
 async function loadDashboard() {
@@ -620,6 +625,11 @@ function updateUndoButton() {
   if (button) button.disabled = !lastDeleted;
 }
 
+function clearUndoState() {
+  lastDeleted = null;
+  updateUndoButton();
+}
+
 async function undoDeleted() {
   if (!lastDeleted) {
     showStatus("没有可撤销的删除。", "error");
@@ -639,6 +649,8 @@ function startEdit(collection, row) {
   const formId = { exposures: "exposureForm", hedges: "hedgeForm", settlements: "settlementForm" }[collection];
   const form = document.getElementById(formId);
   if (!form) return;
+  form.reset();
+  setDefaultDates();
   form.dataset.editId = row.id;
   Object.entries(row).forEach(([key, value]) => {
     if (!form.elements[key]) return;
@@ -783,7 +795,7 @@ function renderBacktest(row) {
   const settled = row.settled !== false;
   const tag = settled ? "" : ' <span class="warn-tag" title="尚未录入到期实际汇率，按当前市场价试算">试算</span>';
   const rateLine = settled
-    ? `实际汇率 ${row.actual_rate}，参考汇率 ${row.reference_rate}`
+    ? `实际汇率 ${row.actual_rate}，${row.reference_rate == null ? "当前市场参考汇率缺失" : `参考汇率 ${row.reference_rate}`}`
     : `未录入实际汇率，按当前市场价 ${row.reference_rate} 试算`;
   div.innerHTML = `
     <strong>${escapeHtml(row.period)} ${escapeHtml(row.currency)}</strong>${tag}
@@ -834,7 +846,16 @@ function auditSummary(row) {
       .map(([key, value]) => `${escapeHtml(key)}：${escapeHtml(auditValue(value.from))} → ${escapeHtml(auditValue(value.to))}`);
     return changes.length ? changes.join("；") : "无实际变化";
   }
-  if (row.collection === "workspace") return "工作区被重置为样例数据";
+  if (row.collection === "workspace") {
+    if (row.action === "clear") return "业务数据已清空";
+    if (row.action === "import") return "工作区已从 JSON 导入";
+    if (row.action === "restore") return "工作区已从备份恢复";
+    if (row.action === "reset") {
+      const mode = (row.after || {}).metadata?.data_mode;
+      return mode === "empty" ? "工作区已重置为空白数据" : "工作区已重置为样例数据";
+    }
+    return "工作区已更新";
+  }
   if (row.collection === "plans") {
     // 方案的载荷里没有 due_date / currency / amount，走下面那个分支会得到空白，
     // 于是"变更记录"答不出删掉的是哪一份方案。
@@ -1037,6 +1058,10 @@ function renderConfig(config) {
     const fallback = field.dataset.jsonType === "array" ? [] : {};
     field.value = JSON.stringify(config[field.name] || fallback, null, 2);
   }
+  const confirmed = config.confirmed_parameters || {};
+  for (const field of form.querySelectorAll("[data-confirmed-key]")) {
+    field.checked = Boolean(confirmed[field.dataset.confirmedKey]);
+  }
 }
 
 const RISK_CATEGORY_NAMES = {
@@ -1084,6 +1109,7 @@ function bindSetupPanel() {
   if (empty) empty.addEventListener("click", async () => {
     await runAction("正在创建空白工作区...", async () => {
       await api("/api/workspace/empty", { method: "POST", body: "{}" });
+      clearUndoState();
       await loadDashboard();
       showStatus("空白工作区已就绪。");
     });
@@ -1091,6 +1117,7 @@ function bindSetupPanel() {
   if (sample) sample.addEventListener("click", async () => {
     await runAction("正在加载样例...", async () => {
       await api("/api/workspace/sample", { method: "POST", body: "{}" });
+      clearUndoState();
       await loadDashboard();
       showStatus("样例数据已加载。");
     });
@@ -1147,6 +1174,7 @@ async function importWorkspace(event) {
     if (!window.confirm("导入会覆盖当前工作区；系统会先自动备份当前数据。确认继续？")) return;
     await runAction("正在导入工作区...", async () => {
       await api("/api/import", { method: "POST", body: JSON.stringify(parsed) });
+      clearUndoState();
       await loadDashboard();
       showStatus("工作区已导入。");
     });
@@ -1256,6 +1284,7 @@ async function restoreLatestBackup() {
   if (!window.confirm("恢复最近备份会覆盖当前工作区；系统会先自动备份当前数据。确认继续？")) return;
   await runAction("正在恢复最近备份...", async () => {
     await api("/api/backups/latest/restore", { method: "POST", body: "{}" });
+    clearUndoState();
     await loadDashboard();
     showStatus("最近备份已恢复。");
   });
@@ -1265,6 +1294,7 @@ async function clearBusinessData() {
   if (!window.confirm("清空会删除当前敞口、锁汇和结算记录；系统会先自动备份当前数据。确认继续？")) return;
   await runAction("正在清空业务数据...", async () => {
     await api("/api/clear-business", { method: "POST", body: "{}" });
+    clearUndoState();
     await loadDashboard();
     showStatus("业务数据已清空。");
   });
@@ -1338,6 +1368,7 @@ function bindForms() {
     if (!window.confirm("恢复样例会覆盖当前敞口、锁汇、结算记录和配置参数；系统会先自动备份当前工作区。确认继续？")) return;
     await runAction("正在恢复样例...", async () => {
       await api("/api/reset-demo", { method: "POST", body: "{}" });
+      clearUndoState();
       await loadDashboard();
       showStatus("样例数据已恢复");
     });

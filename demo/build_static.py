@@ -67,6 +67,12 @@ def demo_state(today: date) -> dict:
     settled = month_end(date(today.year, today.month, 1) - timedelta(days=1))
 
     return {
+        "metadata": {
+            "setup_complete": True,
+            "data_mode": "sample",
+            "created_at": f"{today.isoformat()}T00:00:00Z",
+            "updated_at": f"{today.isoformat()}T00:00:00Z",
+        },
         "config": dict(
             web_app.DEFAULT_CONFIG,
             default_hedge_ratio=0.8,
@@ -177,6 +183,24 @@ SHIM = """<script>
       headers: { "Content-Type": contentType || "text/plain; charset=utf-8" },
     }));
   }
+  function csvCell(value) {
+    var text = value == null ? "" : String(value);
+    if (/^[=+@-]/.test(text)) text = "'" + text;
+    return /[",\\r\\n]/.test(text) ? '"' + text.replace(/"/g, '""') + '"' : text;
+  }
+  function demoCsv(path) {
+    var collection = new URL(path, window.location.href).searchParams.get("collection") || "exposures";
+    var specs = {
+      exposures: { fields: ["id", "created_at", "due_date", "currency", "amount", "direction", "probability", "booked", "category", "description"], rows: BAKED.exposures },
+      hedges: { fields: ["id", "created_at", "trade_date", "due_date", "currency", "action", "amount", "locked_rate", "description"], rows: BAKED.hedges },
+      settlements: { fields: ["id", "created_at", "due_date", "currency", "actual_rate", "actual_amount", "description"], rows: BAKED.settlements },
+    };
+    var spec = specs[collection];
+    if (!spec) return null;
+    return [spec.fields.join(",")].concat((spec.rows || []).map(function (row) {
+      return spec.fields.map(function (field) { return csvCell(row[field]); }).join(",");
+    })).join("\\r\\n") + "\\r\\n";
+  }
   var realFetch = window.fetch.bind(window);
   window.fetch = function (input, init) {
     var path = String((input && input.url) || input || "");
@@ -189,7 +213,10 @@ SHIM = """<script>
       demo: true,
     });
     if (method === "GET" && path.indexOf("/api/csv/export") !== -1) {
-      return textReply("id,due_date,currency,amount,description\\nstatic-demo,,,,只读演示导出\\n", 200, "text/csv; charset=utf-8");
+      var csv = demoCsv(path);
+      return csv === null
+        ? reply({ ok: false, error: "不支持的明细类型。" }, 400)
+        : textReply(csv, 200, "text/csv; charset=utf-8");
     }
     if (method === "GET" && path.indexOf("/api/xlsx/export") !== -1) {
       return reply({

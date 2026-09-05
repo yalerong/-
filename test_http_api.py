@@ -297,6 +297,23 @@ class HttpApiTest(unittest.TestCase):
         self.assertTrue(after["audit"], "一条超大记录不该把整段历史读没了")
         self.assertEqual(after["audit"][0]["action"], "reset")
 
+    def test_audit_recovers_large_entry_that_straddles_tail_window(self):
+        giant = {"at": "2026-08-31T00:00:00Z", "action": "reset", "collection": "workspace",
+                 "id": None, "before": {"blob": "x" * (web_app.AUDIT_TAIL_BYTES + 5000)},
+                 "after": None}
+        small = {"at": "2026-08-31T00:01:00Z", "action": "create", "collection": "exposures",
+                 "id": "small", "before": None, "after": {"id": "small"}}
+        web_app.AUDIT_LOG_FILE.write_text(
+            json.dumps(giant) + chr(10) + json.dumps(small) + chr(10),
+            encoding="utf-8",
+        )
+
+        rows = web_app.read_audit(30)
+
+        actions = [row["action"] for row in rows]
+        self.assertEqual(actions[0], "create")
+        self.assertIn("reset", actions)
+
     def test_failed_validation_leaves_no_audit_entry(self):
         _, before = request("GET", f"{self.base}/api/state")
         request("POST", f"{self.base}/api/exposures", {"currency": "USD"})
