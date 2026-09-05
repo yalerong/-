@@ -97,6 +97,45 @@ class WebAppLogicTest(unittest.TestCase):
             any("还没录入到期实际汇率" in line for line in dashboard["plain_language"])
         )
 
+    def test_settled_backtest_survives_missing_market_rate(self):
+        state = copy.deepcopy(web_app.DEMO_STATE)
+        state["config"] = dict(web_app.DEFAULT_CONFIG, supported_currencies=["USD", "CHF"])
+        state["exposures"] = [{
+            "id": "chf-exp",
+            "due_date": "2026-06-30",
+            "currency": "CHF",
+            "amount": 100000,
+            "direction": "receipt",
+            "category": "cash_flow",
+            "probability": 1,
+        }]
+        state["hedges"] = [{
+            "id": "chf-hedge",
+            "trade_date": "2026-05-01",
+            "due_date": "2026-06-30",
+            "currency": "CHF",
+            "amount": 50000,
+            "action": "sell_foreign",
+            "locked_rate": 8.1,
+        }]
+        state["settlements"] = [{
+            "id": "chf-settle",
+            "due_date": "2026-06-30",
+            "currency": "CHF",
+            "actual_rate": 8.2,
+        }]
+
+        dashboard = web_app.build_dashboard(
+            state,
+            {"source": "test", "status": "test", "fetched_at": "x", "pair_rates": {"USD": 7.2}},
+            forecast_doc={},
+        )
+
+        chf = next(row for row in dashboard["backtest"] if row["currency"] == "CHF")
+        self.assertTrue(chf["settled"])
+        self.assertEqual(chf["actual_rate"], 8.2)
+        self.assertIsNone(chf["reference_rate"])
+
     def test_scenario_totals_sum_every_currency_and_period(self):
         dashboard = web_app.build_dashboard(web_app.DEMO_STATE, self.rates, forecast_doc={})
         totals = dashboard["scenario_totals"]
@@ -180,6 +219,36 @@ class WebAppLogicTest(unittest.TestCase):
         self.assertIn("ZZZ", portfolio["rate_missing"])
         zzz = next(row for row in portfolio["by_currency"] if row["currency"] == "ZZZ")
         self.assertEqual(zzz["gross_cny"], 0)
+
+    def test_missing_rate_blocks_recommendations_and_trial_pricing(self):
+        state = copy.deepcopy(web_app.DEMO_STATE)
+        state["exposures"] = [{
+            "id": "e-missing", "due_date": "2027-03-31", "currency": "ZZZ",
+            "amount": 1000000, "direction": "receipt", "category": "order_contract",
+            "probability": 1,
+        }]
+        state["hedges"] = []
+        state["settlements"] = []
+
+        dashboard = web_app.build_dashboard(state, self.rates, forecast_doc={})
+        zzz = dashboard["net_exposures"][0]
+
+        self.assertFalse(zzz["rate_available"])
+        self.assertIsNone(zzz["current_rate"])
+        self.assertIsNone(zzz["cny_risk"])
+        self.assertEqual(dashboard["suggestions"], [])
+        self.assertEqual(dashboard["scenario_rows"], [])
+        self.assertIn("ZZZ", dashboard["portfolio"]["rate_missing"])
+
+    def test_recommendations_are_marked_trial_until_pricing_inputs_are_confirmed(self):
+        state = copy.deepcopy(web_app.DEMO_STATE)
+        state["config"] = dict(web_app.DEFAULT_CONFIG)
+        dashboard = web_app.build_dashboard(state, self.rates, forecast_doc={})
+
+        self.assertTrue(dashboard["suggestions"])
+        self.assertTrue(all(row["trial"] for row in dashboard["suggestions"]))
+        self.assertTrue(any("confirm" in reason for row in dashboard["suggestions"]
+                            for reason in row["trial_reasons"]))
 
     def test_neutral_scenario_is_not_zero_once_there_are_forward_points(self):
         """远期贴水本身就是成本，中性场景不该恒等于 0。

@@ -67,6 +67,12 @@ def demo_state(today: date) -> dict:
     settled = month_end(date(today.year, today.month, 1) - timedelta(days=1))
 
     return {
+        "metadata": {
+            "setup_complete": True,
+            "data_mode": "sample",
+            "created_at": f"{today.isoformat()}T00:00:00Z",
+            "updated_at": f"{today.isoformat()}T00:00:00Z",
+        },
         "config": dict(
             web_app.DEFAULT_CONFIG,
             default_hedge_ratio=0.8,
@@ -171,12 +177,69 @@ SHIM = """<script>
       headers: { "Content-Type": "application/json; charset=utf-8" },
     }));
   }
+  function textReply(text, status, contentType) {
+    return Promise.resolve(new Response(text, {
+      status: status || 200,
+      headers: { "Content-Type": contentType || "text/plain; charset=utf-8" },
+    }));
+  }
+  function csvCell(value) {
+    var text = value == null ? "" : String(value);
+    if (/^[=+@-]/.test(text)) text = "'" + text;
+    return /[",\\r\\n]/.test(text) ? '"' + text.replace(/"/g, '""') + '"' : text;
+  }
+  function demoCsv(path) {
+    var collection = new URL(path, window.location.href).searchParams.get("collection") || "exposures";
+    var specs = {
+      exposures: { fields: ["id", "created_at", "due_date", "currency", "amount", "direction", "probability", "booked", "category", "description"], rows: BAKED.exposures },
+      hedges: { fields: ["id", "created_at", "trade_date", "due_date", "currency", "action", "amount", "locked_rate", "description"], rows: BAKED.hedges },
+      settlements: { fields: ["id", "created_at", "due_date", "currency", "actual_rate", "actual_amount", "description"], rows: BAKED.settlements },
+    };
+    var spec = specs[collection];
+    if (!spec) return null;
+    return [spec.fields.join(",")].concat((spec.rows || []).map(function (row) {
+      return spec.fields.map(function (field) { return csvCell(row[field]); }).join(",");
+    })).join("\\r\\n") + "\\r\\n";
+  }
   var realFetch = window.fetch.bind(window);
   window.fetch = function (input, init) {
     var path = String((input && input.url) || input || "");
     if (path.indexOf("/api/") === -1) return realFetch(input, init);
     var method = ((init && init.method) || "GET").toUpperCase();
     if (method === "GET" && path.indexOf("/api/state") !== -1) return reply(BAKED);
+    if (method === "GET" && (path.indexOf("/api/export") !== -1 || path.indexOf("/api/workspace/export") !== -1)) return reply({
+      exported_at: BAKED.workspace && BAKED.workspace.metadata && BAKED.workspace.metadata.updated_at,
+      state: BAKED,
+      demo: true,
+    });
+    if (method === "GET" && path.indexOf("/api/csv/export") !== -1) {
+      var csv = demoCsv(path);
+      return csv === null
+        ? reply({ ok: false, error: "不支持的明细类型。" }, 400)
+        : textReply(csv, 200, "text/csv; charset=utf-8");
+    }
+    if (method === "GET" && path.indexOf("/api/xlsx/export") !== -1) {
+      return reply({
+        ok: false,
+        error: "这是只读的静态演示站，不能导出 Excel。真实工具在本地运行（见页脚仓库链接）。",
+      }, 403);
+    }
+    if (path.indexOf("/api/csv/import") !== -1) {
+      return reply({
+        ok: false,
+        error: "这是只读的静态演示站，不能导入 CSV。真实工具在本地运行（见页脚仓库链接）。",
+      }, 403);
+    }
+    if (path.indexOf("/api/xlsx/import") !== -1) {
+      return reply({
+        ok: false,
+        error: "这是只读的静态演示站，不能导入 Excel。真实工具在本地运行（见页脚仓库链接）。",
+      }, 403);
+    }
+    if (method === "GET" && path.indexOf("/api/backups") !== -1) return reply({
+      backups: [],
+      data_file: "static demo",
+    });
     return reply({
       ok: false,
       error: "这是只读的静态演示站，改不了数据。真实工具在本地运行（见页脚仓库链接）。",

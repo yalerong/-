@@ -1,15 +1,27 @@
 from __future__ import annotations
 
 import argparse
+import base64
+import binascii
+import copy
+import csv
+import io
 import json
+import math
 import mimetypes
+import os
+import posixpath
+import re
 import threading
 import uuid
+import zipfile
 from collections import defaultdict
 from datetime import date as dt_date, datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from urllib.parse import urlparse
+from xml.etree import ElementTree as ET
+from xml.sax.saxutils import escape as xml_escape
+from urllib.parse import parse_qs, urlparse
 from urllib.error import URLError
 from urllib.request import Request, urlopen
 
@@ -27,7 +39,12 @@ STATE_FILE = DATA_DIR / "fx_workspace.json"
 RATES_CACHE_FILE = DATA_DIR / "rates_cache.json"
 FORECAST_SIGNALS_FILE = DATA_DIR / "forecast_signals.json"
 AUDIT_LOG_FILE = DATA_DIR / "audit_log.jsonl"
+BACKUP_DIR = DATA_DIR / "backups"
 BASE_CURRENCY = "CNY"
+MAX_BACKUPS = 20
+DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+PERIOD_RE = re.compile(r"^\d{4}-\d{2}$")
+CURRENCY_RE = re.compile(r"^[A-Z]{3}$")
 
 # Serializes the read-modify-write of the JSON state file so concurrent
 # requests on the ThreadingHTTPServer can't clobber each other.
@@ -52,6 +69,8 @@ DEFAULT_CONFIG = {
     "interest_rates": {"CNY": 0.019, "USD": 0.043, "EUR": 0.025, "JPY": 0.005,
                        "HKD": 0.042, "GBP": 0.045, "AUD": 0.038, "SGD": 0.032},
     "forward_overrides": {},
+    "monthly_average_rates": {},
+    "confirmed_parameters": {},
     # 情景默认对所有币种同幅同向变动，等于假设币种间相关性为 1。
     # 对"净收美元 + 净付欧元"这种组合会天然对冲、把风险算小，
     # 要按币种分别设就写在这里：{"USD": {"optimistic": 0.03, ...}}
@@ -140,24 +159,400 @@ def now_iso() -> str:
 
 def read_json(path: Path, default: dict) -> dict:
     if not path.exists():
-        return default
+        return copy.deepcopy(default)
     return json.loads(path.read_text(encoding="utf-8"))
 
 
 def write_json(path: Path, data: dict) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+    tmp = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
+    try:
+        with tmp.open("w", encoding="utf-8", newline="\n") as handle:
+            handle.write(json.dumps(data, ensure_ascii=False, indent=2))
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(tmp, path)
+    finally:
+        # replace 失败时不让临时文件长期堆在数据目录；成功时路径已经不存在。
+        tmp.unlink(missing_ok=True)
 
 
 def ensure_state() -> dict:
     DATA_DIR.mkdir(exist_ok=True)
     if not STATE_FILE.exists():
-        write_json(STATE_FILE, DEMO_STATE)
-    return read_json(STATE_FILE, DEMO_STATE)
+        state = empty_state()
+        save_state(state, reason="first-run", backup=False)
+        return state
+    try:
+        return validate_workspace_state(read_json(STATE_FILE, empty_state()))
+    except (OSError, json.JSONDecodeError, ValueError):
+        preserve_corrupt_state()
+        backup = latest_backup_file()
+        if backup:
+            state = validate_workspace_state(read_json(backup, empty_state()))
+            save_state(state, reason="recover", backup=False)
+            return state
+        state = empty_state()
+        save_state(state, reason="recover-empty", backup=False)
+        return state
 
 
-def save_state(state: dict) -> None:
-    write_json(STATE_FILE, state)
+def _safe_backup_reason(reason: str) -> str:
+    return re.sub(r"[^a-zA-Z0-9_.-]+", "-", reason).strip("-")[:40] or "state"
+
+
+def backup_dir() -> Path:
+    return DATA_DIR / "backups"
+
+
+def _stat_backups(directory: Path) -> list[tuple[Path, os.stat_result]]:
+    """备份文件按修改时间倒序，stat 失败的直接跳过。
+
+    列备份和别的请求剪枝备份是并发的：glob 到的文件在 stat 之前可能已经
+    被删掉。排序 key 里直接 stat 会把 FileNotFoundError 抛到整个请求外面。
+    """
+    entries = []
+    for path in directory.glob("*.json"):
+        try:
+            entries.append((path, path.stat()))
+        except OSError:
+            continue
+    entries.sort(key=lambda item: item[1].st_mtime, reverse=True)
+    return entries
+
+
+def list_backups() -> list[dict]:
+    directory = backup_dir()
+    if not directory.exists():
+        return []
+    return [
+        {
+            "name": path.name,
+            "size": stat.st_size,
+            "created_at": datetime.fromtimestamp(stat.st_mtime, timezone.utc)
+            .replace(microsecond=0).isoformat().replace("+00:00", "Z"),
+        }
+        for path, stat in _stat_backups(directory)
+    ]
+
+
+def prune_backups() -> None:
+    for path, _ in _stat_backups(backup_dir())[MAX_BACKUPS:]:
+        try:
+            path.unlink()
+        except OSError:
+            pass
+
+
+def backup_current_state(reason: str) -> dict | None:
+    if not STATE_FILE.exists():
+        return None
+    directory = backup_dir()
+    directory.mkdir(parents=True, exist_ok=True)
+    stamp = utc_now().strftime("%Y%m%dT%H%M%SZ")
+    target = directory / f"{stamp}-{_safe_backup_reason(reason)}-{uuid.uuid4().hex[:8]}.json"
+    try:
+        target.write_bytes(STATE_FILE.read_bytes())
+        prune_backups()
+        return {"name": target.name, "size": target.stat().st_size}
+    except OSError:
+        return None
+
+
+def save_state(state: dict, reason: str = "state", backup: bool = True) -> None:
+    if isinstance(state.get("metadata"), dict):
+        state["metadata"]["updated_at"] = now_iso()
+    # 先校验、再轮换备份：端点级检查过了但整体校验不过的请求（比如配置里
+    # 删掉了仍有记录在用的币种）什么都没写，却会白吃一格备份槽位；
+    # 重复几次就把真正有用的回滚快照挤没了。
+    normalized = validate_workspace_state(state)
+    if backup:
+        backup_current_state(reason)
+    write_json(STATE_FILE, normalized)
+    if backup:
+        # 保存后的快照用于主文件损坏时恢复；用户主动“恢复最近备份”会跳过它，
+        # 选择最近一次操作前的快照，见 latest_undo_backup_file。
+        backup_current_state(f"{reason}-after")
+
+
+def parse_iso_date(value: object, field: str) -> dt_date:
+    if not isinstance(value, str) or not DATE_RE.match(value):
+        raise ValueError(f"{field} 必须是 YYYY-MM-DD 日期")
+    try:
+        return dt_date.fromisoformat(value)
+    except ValueError:
+        raise ValueError(f"{field} 不是有效日期") from None
+
+
+def positive_number(value: object, field: str) -> float:
+    if isinstance(value, bool):
+        raise ValueError(f"{field} 必须是数字")
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        raise ValueError(f"{field} 必须是数字") from None
+    if not math.isfinite(number) or number <= 0:
+        raise ValueError(f"{field} 必须大于 0")
+    return number
+
+
+def non_negative_number(value: object, field: str) -> float:
+    if isinstance(value, bool):
+        raise ValueError(f"{field} 必须是数字")
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        raise ValueError(f"{field} 必须是数字") from None
+    if not math.isfinite(number) or number < 0:
+        raise ValueError(f"{field} 不能为负")
+    return number
+
+
+def finite_number(value: object, field: str) -> float:
+    if isinstance(value, bool):
+        raise ValueError(f"{field} 必须是数字")
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        raise ValueError(f"{field} 必须是数字") from None
+    if not math.isfinite(number):
+        raise ValueError(f"{field} 必须是有限数字")
+    return number
+
+
+def validate_period(value: object, field: str) -> str:
+    if not isinstance(value, str) or not PERIOD_RE.match(value):
+        raise ValueError(f"{field} 的月份必须是 YYYY-MM")
+    try:
+        dt_date.fromisoformat(f"{value}-01")
+    except ValueError:
+        raise ValueError(f"{field} 包含无效月份 {value}") from None
+    return value
+
+
+def validate_currency_code(value: object, field: str) -> str:
+    if not isinstance(value, str) or not CURRENCY_RE.match(value):
+        raise ValueError(f"{field} 的币种必须是三位大写字母")
+    return value
+
+
+def validate_period_currency_map(mapping: dict, field: str, value_validator) -> dict:
+    """校验 `YYYY-MM:USD -> 值` 和 `YYYY-MM -> {USD: 值}` 两种公开格式。"""
+    validated = {}
+    for key, raw in mapping.items():
+        if not isinstance(key, str):
+            raise ValueError(f"{field} 的键必须是字符串")
+        if ":" in key:
+            parts = key.split(":")
+            if len(parts) != 2:
+                raise ValueError(f"{field} 的键必须是 YYYY-MM:币种")
+            period, currency = parts
+            validate_period(period, field)
+            validate_currency_code(currency, field)
+            validated[key] = value_validator(raw, f"{field}.{key}")
+            continue
+        validate_period(key, field)
+        if not isinstance(raw, dict) or not raw:
+            raise ValueError(f"{field}.{key} 必须是按币种填写的对象")
+        nested = {}
+        for currency, value in raw.items():
+            validate_currency_code(currency, field)
+            nested[currency] = value_validator(value, f"{field}.{key}.{currency}")
+        validated[key] = nested
+    return validated
+
+
+def validate_currency(row: dict, config: dict) -> str:
+    currency = row.get("currency")
+    supported = config.get("supported_currencies") or DEFAULT_CONFIG["supported_currencies"]
+    if not isinstance(currency, str) or not CURRENCY_RE.match(currency):
+        raise ValueError("币种必须是三位大写字母，例如 USD")
+    if currency not in supported:
+        raise ValueError(f"币种 {currency} 不在 supported_currencies 内")
+    return currency
+
+
+def merge_config(base: dict, patch: dict, replace_maps: set[str] | None = None) -> dict:
+    merged = copy.deepcopy(base)
+    replace_maps = replace_maps or set()
+    for key, value in (patch or {}).items():
+        if key in replace_maps:
+            merged[key] = copy.deepcopy(value)
+        elif isinstance(value, dict) and isinstance(merged.get(key), dict):
+            nested = copy.deepcopy(merged[key])
+            nested.update(value)
+            merged[key] = nested
+        else:
+            merged[key] = value
+    return merged
+
+
+def validate_config(payload: dict, base: dict | None = None, replace_maps: set[str] | None = None) -> dict:
+    if not isinstance(payload, dict):
+        raise ValueError("配置必须是对象")
+    config = merge_config(base or DEFAULT_CONFIG, payload, replace_maps=replace_maps)
+    # 全站汇率都按「1 外币 = N 元人民币」记，远期定价拿 base_currency 去查
+    # 利率。导入的工作区把它改成别的币种，远期价就静默用错利率。
+    if config.get("base_currency", BASE_CURRENCY) != BASE_CURRENCY:
+        raise ValueError(f"base_currency 只支持 {BASE_CURRENCY}")
+    config["base_currency"] = BASE_CURRENCY
+    currencies = config.get("supported_currencies")
+    if not isinstance(currencies, list) or not currencies:
+        raise ValueError("supported_currencies 必须是非空列表")
+    for currency in currencies:
+        if not isinstance(currency, str) or not CURRENCY_RE.match(currency):
+            raise ValueError("supported_currencies 只能包含三位大写币种")
+    if len(set(currencies)) != len(currencies):
+        raise ValueError("supported_currencies 不能包含重复币种")
+    if BASE_CURRENCY in currencies:
+        raise ValueError("supported_currencies 不需要包含 CNY")
+    config["rate_cache_hours"] = positive_number(config.get("rate_cache_hours"), "rate_cache_hours")
+    config["risk_limit_cny"] = non_negative_number(config.get("risk_limit_cny", 0), "risk_limit_cny")
+    ratio = non_negative_number(config.get("default_hedge_ratio", 0), "default_hedge_ratio")
+    if ratio > 1:
+        raise ValueError("default_hedge_ratio 必须在 0 到 1 之间")
+    config["default_hedge_ratio"] = ratio
+    if config.get("enterprise_type") not in {"comprehensive", "export", "import"}:
+        raise ValueError("enterprise_type 不合法")
+    for key in ("optimistic_shift_pct", "pessimistic_shift_pct", "custom_scenario_shift_pct"):
+        config[key] = finite_number(config.get(key, 0), key)
+        if config[key] <= -1:
+            raise ValueError(f"{key} 必须大于 -1")
+    for key in ("interest_rates", "forward_overrides", "scenario_shifts",
+                "month_currency_hedge_ratios", "monthly_average_rates",
+                "confirmed_parameters"):
+        if not isinstance(config.get(key, {}), dict):
+            raise ValueError(f"{key} 必须是对象")
+
+    interest_rates = {}
+    for currency, value in config["interest_rates"].items():
+        validate_currency_code(currency, "interest_rates")
+        rate = finite_number(value, f"interest_rates.{currency}")
+        if not -1 < rate <= 1:
+            raise ValueError(f"interest_rates.{currency} 必须在 -1 到 1 之间")
+        interest_rates[currency] = rate
+    config["interest_rates"] = interest_rates
+
+    config["forward_overrides"] = validate_period_currency_map(
+        config["forward_overrides"], "forward_overrides", positive_number,
+    )
+    config["monthly_average_rates"] = validate_period_currency_map(
+        config["monthly_average_rates"], "monthly_average_rates", positive_number,
+    )
+
+    def validate_ratio(value: object, field: str) -> float:
+        ratio_value = non_negative_number(value, field)
+        if ratio_value > 1:
+            raise ValueError(f"{field} 必须在 0 到 1 之间")
+        return ratio_value
+
+    config["month_currency_hedge_ratios"] = validate_period_currency_map(
+        config["month_currency_hedge_ratios"], "month_currency_hedge_ratios", validate_ratio,
+    )
+
+    scenario_shifts = {}
+    valid_scenarios = {"neutral", "optimistic", "pessimistic", "custom"}
+    for currency, values in config["scenario_shifts"].items():
+        validate_currency_code(currency, "scenario_shifts")
+        if not isinstance(values, dict) or not values:
+            raise ValueError(f"scenario_shifts.{currency} 必须是按情景填写的对象")
+        unknown = set(values) - valid_scenarios
+        if unknown:
+            raise ValueError(f"scenario_shifts.{currency} 包含未知情景: {', '.join(sorted(unknown))}")
+        scenario_shifts[currency] = {}
+        for scenario, value in values.items():
+            shift = finite_number(value, f"scenario_shifts.{currency}.{scenario}")
+            if shift <= -1:
+                raise ValueError(f"scenario_shifts.{currency}.{scenario} 必须大于 -1")
+            scenario_shifts[currency][scenario] = shift
+    config["scenario_shifts"] = scenario_shifts
+
+    for key, value in config["confirmed_parameters"].items():
+        if not isinstance(key, str) or not isinstance(value, bool):
+            raise ValueError("confirmed_parameters 必须使用字符串键和布尔值")
+    return config
+
+
+def latest_backup_file() -> Path | None:
+    rows = _stat_backups(backup_dir())
+    return rows[0][0] if rows else None
+
+
+def latest_undo_backup_file() -> Path | None:
+    rows = [path for path, _ in _stat_backups(backup_dir()) if "-after-" not in path.name]
+    return rows[0] if rows else None
+
+
+def preserve_corrupt_state() -> Path | None:
+    if not STATE_FILE.exists():
+        return None
+    stamp = utc_now().strftime("%Y%m%dT%H%M%SZ")
+    target = STATE_FILE.with_name(f"{STATE_FILE.name}.corrupt-{stamp}-{uuid.uuid4().hex[:8]}")
+    try:
+        STATE_FILE.replace(target)
+        return target
+    except OSError:
+        return None
+
+
+def empty_state(setup_complete: bool = False) -> dict:
+    return {
+        "metadata": {
+            "setup_complete": setup_complete,
+            "data_mode": "empty",
+            "created_at": now_iso(),
+            "updated_at": now_iso(),
+        },
+        "config": copy.deepcopy(DEFAULT_CONFIG),
+        "exposures": [],
+        "hedges": [],
+        "settlements": [],
+        "plans": [],
+    }
+
+
+def sample_state(keep_plans: list[dict] | None = None) -> dict:
+    state = copy.deepcopy(DEMO_STATE)
+    state["metadata"] = {
+        "setup_complete": True,
+        "data_mode": "sample",
+        "created_at": now_iso(),
+        "updated_at": now_iso(),
+    }
+    state["config"] = validate_config(state.get("config", {}), base=DEFAULT_CONFIG)
+    state["plans"] = copy.deepcopy(keep_plans or [])
+    return state
+
+
+def validate_workspace_state(state: dict) -> dict:
+    if not isinstance(state, dict):
+        raise ValueError("工作区数据必须是对象")
+    normalized = copy.deepcopy(state)
+    if not isinstance(normalized.get("metadata", {}), dict):
+        raise ValueError("metadata 必须是对象")
+    normalized.setdefault("metadata", {})
+    normalized["metadata"].setdefault("setup_complete", True)
+    normalized["metadata"].setdefault("data_mode", "imported")
+    normalized["metadata"].setdefault("created_at", now_iso())
+    normalized["metadata"].setdefault("updated_at", normalized["metadata"]["created_at"])
+    normalized["config"] = validate_config(normalized.get("config", {}), base=DEFAULT_CONFIG)
+    for key in ("exposures", "hedges", "settlements", "plans"):
+        value = normalized.get(key, [])
+        if not isinstance(value, list):
+            raise ValueError(f"{key} 必须是列表")
+        normalized[key] = value
+    for key in ("exposures", "hedges", "settlements"):
+        if any(not isinstance(row, dict) for row in normalized[key]):
+            raise ValueError(f"{key} 只能包含对象")
+    for row in normalized["exposures"]:
+        validate_exposure(row, normalized["config"], allow_legacy_category=True)
+    for row in normalized["hedges"]:
+        validate_hedge(row, normalized["config"])
+    for row in normalized["settlements"]:
+        validate_settlement(row, normalized["config"])
+    for row in normalized["plans"]:
+        validate_plan_snapshot(row)
+    return normalized
 
 
 def append_audit(action: str, collection: str, record_id: str | None, before: dict | None, after: dict | None) -> dict:
@@ -187,6 +582,23 @@ def append_audit(action: str, collection: str, record_id: str | None, before: di
 # 只读文件尾部这么多字节。日志只追加不截断，每次刷新面板都整份读一遍的话，
 # 开销会随历史线性增长；reset 那种条目还会带整个工作区快照，放大得更快。
 AUDIT_TAIL_BYTES = 256 * 1024
+AUDIT_SCAN_CHUNK_BYTES = 64 * 1024
+
+
+def _audit_tail_start(handle, size: int) -> int:
+    start = max(0, size - AUDIT_TAIL_BYTES)
+    if start == 0:
+        return 0
+    pos = start
+    while pos > 0:
+        block_start = max(0, pos - AUDIT_SCAN_CHUNK_BYTES)
+        handle.seek(block_start)
+        block = handle.read(pos - block_start)
+        newline = block.rfind(b"\n")
+        if newline >= 0:
+            return block_start + newline + 1
+        pos = block_start
+    return 0
 
 
 def read_audit(limit: int = 50) -> list[dict]:
@@ -196,13 +608,13 @@ def read_audit(limit: int = 50) -> list[dict]:
         with AUDIT_LOG_FILE.open("rb") as handle:
             handle.seek(0, 2)
             size = handle.tell()
-            start = max(0, size - AUDIT_TAIL_BYTES)
+            start = _audit_tail_start(handle, size)
             handle.seek(start)
             chunk = handle.read()
     except OSError:
         return []
 
-    rows = _parse_audit_lines(chunk.decode("utf-8", errors="ignore"), truncated=start > 0, limit=limit)
+    rows = _parse_audit_lines(chunk.decode("utf-8", errors="ignore"), truncated=False, limit=limit)
     if not rows and start > 0:
         # 单条记录就可能超过尾部窗口（reset 会把整个工作区连同全部方案
         # 快照塞进 before/after）。这时尾部里一条完整记录都没有，
@@ -417,8 +829,27 @@ def aggregate_rows(rows: list[dict], sign_fn) -> dict[tuple[str, str], float]:
     return totals
 
 
-def current_rate(pair_rates: dict[str, float], currency: str) -> float:
-    return float(pair_rates.get(currency, FALLBACK_PAIR_RATES.get(currency, 1.0)))
+def current_rate(pair_rates: dict[str, float], currency: str) -> float | None:
+    value = pair_rates.get(currency)
+    return None if value is None else float(value)
+
+
+def trial_reasons_for(config: dict, currency: str, period: str, forward_basis: str) -> list[str]:
+    reasons: list[str] = []
+    confirmed = config.get("confirmed_parameters") or {}
+    if not confirmed.get("rates"):
+        reasons.append("confirm current spot rates before execution")
+    if forward_basis != "quote":
+        reasons.append("confirm bank forward quote before execution")
+    if not confirmed.get("interest_rates"):
+        reasons.append("confirm funding rates before relying on CIP pricing")
+    ratios = config.get("month_currency_hedge_ratios") or {}
+    if not (ratios.get(f"{period}:{currency}") is not None or
+            (isinstance(ratios.get(period), dict) and ratios[period].get(currency) is not None)):
+        reasons.append("confirm target hedge ratio for this month and currency")
+    if not confirmed.get("scenario_shifts"):
+        reasons.append("confirm scenario assumptions")
+    return reasons
 
 
 def hedge_ratio_for(config: dict, period: str, currency: str) -> float:
@@ -616,8 +1047,8 @@ def build_dashboard(
         hedged = hedge_totals.get((period, currency), 0.0)
         net = gross + hedged
         rate = current_rate(pair_rates, currency)
-        rate_available = currency in pair_rates or currency in FALLBACK_PAIR_RATES
-        cny_risk = abs(net * rate)
+        rate_available = rate is not None
+        cny_risk = abs(net * rate) if rate_available else None
         target_ratio = hedge_ratio_for(config, period, currency)
         category = exposure_category_for(exposures, period, currency)
         # 远期结汇不是按即期价成交的，交易价要用远期价
@@ -625,10 +1056,10 @@ def build_dashboard(
         # 前端预填的锁汇单必须全部用这同一个日期，否则定价的合约
         # 和实际下的合约不是一张。
         due_date = forwards.period_end_iso(period)
-        fwd = forwards.forward_rate(rate, currency, period, config, today=today)
-        trade_rate = fN(fwd["rate"], 6)
+        fwd = forwards.forward_rate(rate, currency, period, config, today=today) if rate_available else None
+        trade_rate = fN(fwd["rate"], 6) if fwd else None
         # 到期日已过的敞口还留在建议里，说明它没被处理掉——不自动删，但要标出来
-        past_due = fwd["tenor_years"] <= 0
+        past_due = bool(fwd and fwd["tenor_years"] <= 0)
         net_rows.append(
             {
                 "period": period,
@@ -643,11 +1074,14 @@ def build_dashboard(
                 "net_exposure": f2(net),
                 "current_rate": rate,
                 "rate_available": rate_available,
-                "cny_risk": f2(cny_risk),
+                "cny_risk": f2(cny_risk) if cny_risk is not None else None,
                 # 仅作提示：阈值不参与建议金额的计算，见 README「风险阈值」一节
                 "over_risk_limit": bool(rate_available and risk_limit > 0 and cny_risk > risk_limit),
             }
         )
+        if not rate_available:
+            continue
+
         signal = forecast_signals.get(currency)
         multiplier, multiplier_reason = forecast_multiplier(signal, net, period)
         effective_ratio = target_ratio * multiplier
@@ -689,6 +1123,7 @@ def build_dashboard(
             )
 
         if abs(net) > 0 and recommended_amount > 0:
+            trial_reasons = trial_reasons_for(config, currency, period, fwd["basis"])
             recommendation = {
                 "period": period,
                 "currency": currency,
@@ -717,6 +1152,8 @@ def build_dashboard(
                 "action": action,
                 "direction_unexpected": direction_is_unexpected(config, net),
                 "accounting_bucket": bucket,
+                "trial": bool(trial_reasons),
+                "trial_reasons": trial_reasons,
                 "plain_text": suggestion_text(currency, net, effective_ratio, recommended_amount, action),
                 "scenario_projection": projection,
             }
@@ -729,6 +1166,13 @@ def build_dashboard(
     latest_plan = plan_list[-1] if plan_list else None
     plan_drift = plans.drift(latest_plan, config, pair_rates, forecast_signals)
     return {
+        "workspace": {
+            "metadata": state.get("metadata", {}),
+            "data_mode": (state.get("metadata") or {}).get("data_mode", "unknown"),
+            "setup_complete": bool((state.get("metadata") or {}).get("setup_complete", False)),
+            "data_file": str(STATE_FILE),
+            "backup_count": len(list_backups()),
+        },
         "config": config,
         "rates": rates_cache,
         "exposures": exposures,
@@ -946,6 +1390,8 @@ def build_backtest(
         market_rate = current_rate(pair_rates, currency)
         settled_rate = actual_by_key.get(key)
         settled = settled_rate is not None
+        if market_rate is None and not settled:
+            continue
         # 没录到期实际汇率时用当前市场价试算，但必须标出来，
         # 否则这一行看不出是已结算还是估的。
         actual_rate = settled_rate if settled else market_rate
@@ -1020,13 +1466,14 @@ def build_backtest(
                 "benchmark": benchmark,
                 "business_exposure": f2(gross),
                 "actual_rate": fN(actual_rate, 6),
-                "reference_rate": fN(market_rate, 6),
+                "reference_rate": None if market_rate is None else fN(market_rate, 6),
                 "settled": settled,
                 "rate_basis": "settlement" if settled else "market_estimate",
                 "hedge_effect_cny": f2(hedge_effect),
                 "locked_detail": locked_detail,
                 "plain_text": (
-                    f"{period} {currency}: 实际汇率 {actual_rate:.6f}，参考汇率 {market_rate:.6f}，"
+                    f"{period} {currency}: 实际汇率 {actual_rate:.6f}，"
+                    f"{'当前市场参考汇率缺失' if market_rate is None else f'参考汇率 {market_rate:.6f}'}，"
                     f"锁汇贡献 {hedge_effect:,.2f} CNY。"
                     if settled
                     else f"{period} {currency}: 尚未录入到期实际汇率，暂按当前市场价 {market_rate:.6f} 试算，"
@@ -1051,6 +1498,11 @@ def build_plain_language(
     if not net_rows:
         lines.append("还没有敞口。先添加一笔未来外币收款或付款。")
     for row in net_rows:
+        if not row.get("rate_available"):
+            lines.append(
+                f"{row['period']} {row['currency']} 暂无汇率，已暂停人民币风险、远期价格和锁汇建议；请先录入或刷新该币种汇率。"
+            )
+            continue
         side = "净收" if row["net_exposure"] > 0 else "净付"
         lines.append(
             f"{row['period']} {row['currency']} 当前{side} {abs(row['net_exposure']):,.2f}，"
@@ -1094,12 +1546,18 @@ def parse_body(handler: BaseHTTPRequestHandler) -> dict:
     length = int(handler.headers.get("Content-Length", "0"))
     if length <= 0:
         return {}
+    content_type = handler.headers.get("Content-Type", "").split(";", 1)[0].strip().lower()
+    if content_type != "application/json":
+        raise TypeError("POST/PUT 请求必须使用 application/json")
     raw = handler.rfile.read(length).decode("utf-8")
     return json.loads(raw) if raw else {}
 
 
-def add_id(row: dict) -> dict:
+def add_id(row: dict, preserve_existing: bool = True) -> dict:
     row = dict(row)
+    if not preserve_existing:
+        row.pop("id", None)
+        row.pop("created_at", None)
     row["id"] = row.get("id") or uuid.uuid4().hex[:12]
     row["created_at"] = row.get("created_at") or now_iso()
     if "currency" in row:
@@ -1107,11 +1565,355 @@ def add_id(row: dict) -> dict:
     return row
 
 
+def mutable_collection(name: str) -> str | None:
+    return {
+        "exposures": "exposures",
+        "hedges": "hedges",
+        "settlements": "settlements",
+        "plans": "plans",
+    }.get(name)
+
+
+def validate_for_collection(collection: str, row: dict, config: dict | None = None) -> None:
+    if collection == "exposures":
+        validate_exposure(row, config)
+        return
+    if collection == "hedges":
+        validate_hedge(row, config)
+        return
+    if collection == "settlements":
+        validate_settlement(row, config)
+        return
+    if collection == "plans":
+        return
+    raise ValueError("unknown collection")
+
+
+# 方案是 plans.freeze 冻出来的决策快照，前端会把这些字段直接渲染进表格。
+# 导入的 JSON 可以被人手改过，所以每个会渲染的字段都要卡住类型：
+# 数字字段只能是数字，文本字段只能是字符串，否则一段 HTML 就能存进去。
+PLAN_TEXT_FIELDS = ("id", "label", "created_at")
+PLAN_ROW_TEXT_FIELDS = ("period", "action", "forecast_reason", "forward_basis", "accounting_bucket")
+PLAN_ROW_NUMBER_FIELDS = (
+    "business_exposure", "covered_exposure", "net_exposure", "target_hedge_ratio",
+    "forecast_multiplier", "effective_hedge_ratio", "recommended_amount", "spot_rate", "trade_rate",
+)
+
+
+def _optional_text(value: object, field: str) -> None:
+    if value is not None and not isinstance(value, str):
+        raise ValueError(f"{field} 必须是字符串")
+
+
+def _optional_finite(value: object, field: str) -> None:
+    if value is None:
+        return
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value):
+        raise ValueError(f"{field} 必须是数字")
+
+
+def validate_plan_snapshot(row: object) -> None:
+    if not isinstance(row, dict):
+        raise ValueError("plans 中的每份方案必须是对象")
+    for field in PLAN_TEXT_FIELDS:
+        _optional_text(row.get(field), f"方案 {field}")
+    if "config" in row and not isinstance(row.get("config"), dict):
+        raise ValueError("方案 config 必须是对象")
+    if "rate_snapshot" in row and not isinstance(row.get("rate_snapshot"), dict):
+        raise ValueError("方案 rate_snapshot 必须是对象")
+    rate_snapshot = row.get("rate_snapshot") or {}
+    _optional_text(rate_snapshot.get("status"), "方案 rate_snapshot.status")
+    if not isinstance(rate_snapshot.get("pair_rates", {}), dict):
+        raise ValueError("方案 pair_rates 必须是对象")
+    for currency, value in rate_snapshot.get("pair_rates", {}).items():
+        validate_currency_code(currency, "方案 pair_rates")
+        if finite_number(value, f"方案 pair_rates.{currency}") == 0:
+            raise ValueError(f"方案 pair_rates.{currency} 不能为 0")
+    rows = row.get("rows", [])
+    if not isinstance(rows, list):
+        raise ValueError("方案 rows 必须是列表")
+    for item in rows:
+        if not isinstance(item, dict):
+            raise ValueError("方案 rows 只能包含对象")
+        if not isinstance(item.get("currency"), str):
+            raise ValueError("方案 rows.currency 必须是字符串")
+        for field in PLAN_ROW_TEXT_FIELDS:
+            _optional_text(item.get(field), f"方案 rows.{field}")
+        for field in PLAN_ROW_NUMBER_FIELDS:
+            _optional_finite(item.get(field), f"方案 rows.{field}")
+
+
+def same_origin(handler: BaseHTTPRequestHandler, value: str) -> bool:
+    parsed = urlparse(value)
+    host = handler.headers.get("Host", "")
+    return parsed.scheme in {"http", "https"} and parsed.netloc == host
+
+
+def check_mutation_headers(handler: BaseHTTPRequestHandler) -> tuple[int, str] | None:
+    if handler.headers.get("Sec-Fetch-Site", "").lower() == "cross-site":
+        return 403, "已拒绝跨站写入请求"
+    origin = handler.headers.get("Origin")
+    if origin and not same_origin(handler, origin):
+        return 403, "请求来源（Origin）与当前工作台不同源"
+    referer = handler.headers.get("Referer")
+    if referer and not same_origin(handler, referer):
+        return 403, "请求页面与当前工作台不同源"
+    content_type = handler.headers.get("Content-Type", "")
+    if handler.command in {"POST", "PUT"} and not content_type.lower().startswith("application/json"):
+        return 415, "请求内容必须是 application/json"
+    return None
+
+
+def restore_backup(name: str | None = None) -> dict:
+    directory = backup_dir().resolve()
+    if name is None:
+        latest = latest_undo_backup_file()
+        if latest is None:
+            raise FileNotFoundError("没有可恢复的备份")
+        name = latest.name
+    candidate = (directory / name).resolve()
+    if candidate.parent != directory or not candidate.name.endswith(".json"):
+        raise ValueError("备份名称不合法")
+    if not candidate.exists():
+        raise FileNotFoundError("备份不存在")
+    state = validate_workspace_state(json.loads(candidate.read_text(encoding="utf-8")))
+    save_state(state, reason="restore-backup")
+    return state
+
+
+CSV_FIELDS = {
+    "exposures": [
+        "id", "created_at", "due_date", "currency", "amount", "direction", "probability",
+        "booked", "category", "description",
+    ],
+    "hedges": [
+        "id", "created_at", "trade_date", "due_date", "currency", "action", "amount",
+        "locked_rate", "description",
+    ],
+    "settlements": [
+        "id", "created_at", "due_date", "currency", "actual_rate", "actual_amount", "description",
+    ],
+}
+
+
+def csv_collection(name: str | None) -> str:
+    if name in CSV_FIELDS:
+        return name
+    raise ValueError("collection 必须是 exposures、hedges 或 settlements")
+
+
+def csv_safe(value) -> str:
+    text = "" if value is None else str(value)
+    return "'" + text if text.startswith(("=", "+", "-", "@")) else text
+
+
+def export_collection_csv(state: dict, collection: str) -> str:
+    fields = CSV_FIELDS[collection]
+    out = io.StringIO()
+    writer = csv.DictWriter(out, fieldnames=fields, extrasaction="ignore")
+    writer.writeheader()
+    for row in state.get(collection, []):
+        writer.writerow({field: csv_safe(row.get(field, "")) for field in fields})
+    return out.getvalue()
+
+
+def parse_collection_csv(collection: str, text: str, config: dict) -> list[dict]:
+    reader = csv.DictReader(io.StringIO(text or ""))
+    if not reader.fieldnames:
+        raise ValueError("CSV 不能为空")
+    required = {
+        "exposures": {"due_date", "currency", "amount", "direction"},
+        "hedges": {"trade_date", "due_date", "currency", "amount", "action", "locked_rate"},
+        "settlements": {"due_date", "currency", "actual_rate"},
+    }[collection]
+    missing = required - set(reader.fieldnames)
+    if missing:
+        raise ValueError("CSV 缺少字段: " + ", ".join(sorted(missing)))
+    rows = []
+    for line_no, raw in enumerate(reader, start=1):
+        row = {key: value for key, value in raw.items() if key and value not in {None, ""}}
+        try:
+            validate_for_collection(collection, row, config)
+        except ValueError as exc:
+            raise ValueError(f"第 {line_no} 行校验失败: {exc}") from None
+        rows.append(add_id(row, preserve_existing=False))
+    if not rows:
+        raise ValueError("CSV 没有可导入的数据行")
+    return rows
+
+
+XLSX_MAIN_NS = "http://schemas.openxmlformats.org/spreadsheetml/2006/main"
+XLSX_REL_NS = "http://schemas.openxmlformats.org/officeDocument/2006/relationships"
+XLSX_PKG_REL_NS = "http://schemas.openxmlformats.org/package/2006/relationships"
+
+
+def xlsx_col_name(index: int) -> str:
+    name = ""
+    while index:
+        index, remainder = divmod(index - 1, 26)
+        name = chr(65 + remainder) + name
+    return name
+
+
+def xlsx_col_index(ref: str) -> int:
+    total = 0
+    for char in ref:
+        if not char.isalpha():
+            break
+        total = total * 26 + ord(char.upper()) - 64
+    return max(total - 1, 0)
+
+
+def build_xlsx(collection: str, state: dict) -> bytes:
+    fields = CSV_FIELDS[collection]
+    rows = [fields] + [
+        [csv_safe(row.get(field, "")) for field in fields]
+        for row in state.get(collection, [])
+    ]
+    sheet_rows = []
+    for row_index, row in enumerate(rows, start=1):
+        cells = []
+        for col_index, value in enumerate(row, start=1):
+            ref = f"{xlsx_col_name(col_index)}{row_index}"
+            cells.append(
+                f'<c r="{ref}" t="inlineStr"><is><t>{xml_escape(str(value))}</t></is></c>'
+            )
+        sheet_rows.append(f'<row r="{row_index}">{"".join(cells)}</row>')
+    sheet_xml = (
+        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+        f'<worksheet xmlns="{XLSX_MAIN_NS}" xmlns:r="{XLSX_REL_NS}">'
+        f'<sheetData>{"".join(sheet_rows)}</sheetData></worksheet>'
+    )
+    out = io.BytesIO()
+    with zipfile.ZipFile(out, "w", zipfile.ZIP_DEFLATED) as book:
+        book.writestr(
+            "[Content_Types].xml",
+            '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+            '<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">'
+            '<Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>'
+            '<Default Extension="xml" ContentType="application/xml"/>'
+            '<Override PartName="/xl/workbook.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/>'
+            '<Override PartName="/xl/worksheets/sheet1.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/>'
+            "</Types>",
+        )
+        book.writestr(
+            "_rels/.rels",
+            '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+            f'<Relationships xmlns="{XLSX_PKG_REL_NS}">'
+            '<Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="xl/workbook.xml"/>'
+            "</Relationships>",
+        )
+        book.writestr(
+            "xl/workbook.xml",
+            '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+            f'<workbook xmlns="{XLSX_MAIN_NS}" xmlns:r="{XLSX_REL_NS}">'
+            '<sheets><sheet name="Rows" sheetId="1" r:id="rId1"/></sheets></workbook>',
+        )
+        book.writestr(
+            "xl/_rels/workbook.xml.rels",
+            '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+            f'<Relationships xmlns="{XLSX_PKG_REL_NS}">'
+            '<Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet1.xml"/>'
+            "</Relationships>",
+        )
+        book.writestr("xl/worksheets/sheet1.xml", sheet_xml)
+    return out.getvalue()
+
+
+def xlsx_cell_value(cell: ET.Element, shared_strings: list[str]) -> str:
+    ns = {"x": XLSX_MAIN_NS}
+    cell_type = cell.attrib.get("t")
+    if cell_type == "inlineStr":
+        return "".join(cell.itertext())
+    value = cell.find("x:v", ns)
+    if value is None or value.text is None:
+        return ""
+    if cell_type == "s":
+        try:
+            return shared_strings[int(value.text)]
+        except (ValueError, IndexError):
+            return ""
+    return value.text
+
+
+def xlsx_first_sheet_part(book: zipfile.ZipFile) -> str:
+    """顺着 workbook.xml → workbook.xml.rels 找第一张工作表的实际部件名。
+
+    工作簿删过表之后剩下的可能叫 sheet2.xml，写死 sheet1.xml 会把合法文件拒掉。
+    没有工作簿部件的退化包才回退到 sheet1.xml。
+    """
+    names = set(book.namelist())
+    if "xl/workbook.xml" not in names or "xl/_rels/workbook.xml.rels" not in names:
+        if "xl/worksheets/sheet1.xml" in names:
+            return "xl/worksheets/sheet1.xml"
+        raise ValueError("XLSX 缺少 xl/workbook.xml，找不到工作表")
+    workbook = ET.fromstring(book.read("xl/workbook.xml"))
+    sheet = workbook.find(".//x:sheets/x:sheet", {"x": XLSX_MAIN_NS})
+    if sheet is None:
+        raise ValueError("XLSX 工作簿里没有工作表")
+    rel_id = sheet.attrib.get(f"{{{XLSX_REL_NS}}}id")
+    rels = ET.fromstring(book.read("xl/_rels/workbook.xml.rels"))
+    target = next(
+        (rel.attrib.get("Target") for rel in rels.findall("r:Relationship", {"r": XLSX_PKG_REL_NS})
+         if rel.attrib.get("Id") == rel_id),
+        None,
+    )
+    if not target:
+        raise ValueError("XLSX 工作簿关系里找不到第一张工作表")
+    part = target.lstrip("/") if target.startswith("/") else posixpath.normpath(posixpath.join("xl", target))
+    if part not in names:
+        raise ValueError(f"XLSX 缺少工作表部件 {part}")
+    return part
+
+
+def read_xlsx_rows(data: bytes) -> list[list[str]]:
+    ns = {"x": XLSX_MAIN_NS}
+    try:
+        with zipfile.ZipFile(io.BytesIO(data)) as book:
+            sheet_part = xlsx_first_sheet_part(book)
+            shared_strings: list[str] = []
+            if "xl/sharedStrings.xml" in book.namelist():
+                shared_root = ET.fromstring(book.read("xl/sharedStrings.xml"))
+                shared_strings = ["".join(item.itertext()) for item in shared_root.findall("x:si", ns)]
+            root = ET.fromstring(book.read(sheet_part))
+    except zipfile.BadZipFile:
+        raise ValueError("XLSX 文件不是有效的 zip 工作簿") from None
+    except ET.ParseError:
+        raise ValueError("XLSX XML 内容无法解析") from None
+    rows: list[list[str]] = []
+    for row_node in root.findall(".//x:sheetData/x:row", ns):
+        row_values: list[str] = []
+        for cell in row_node.findall("x:c", ns):
+            ref = cell.attrib.get("r", "")
+            index = xlsx_col_index(ref) if ref else len(row_values)
+            while len(row_values) < index:
+                row_values.append("")
+            row_values.append(xlsx_cell_value(cell, shared_strings))
+        if any(value != "" for value in row_values):
+            rows.append(row_values)
+    return rows
+
+
+def parse_collection_xlsx(collection: str, data_b64: str, config: dict) -> list[dict]:
+    try:
+        data = base64.b64decode(data_b64, validate=True)
+    except (TypeError, ValueError, binascii.Error):
+        raise ValueError("data_b64 必须是有效的 base64") from None
+    rows = read_xlsx_rows(data)
+    if not rows:
+        raise ValueError("XLSX 没有可导入的数据")
+    out = io.StringIO()
+    writer = csv.writer(out)
+    writer.writerows(rows)
+    return parse_collection_csv(collection, out.getvalue(), config)
+
+
 class FxRiskHandler(BaseHTTPRequestHandler):
     server_version = "FxRiskLocal/1.0"
 
     def do_GET(self) -> None:
-        path = urlparse(self.path).path
+        parsed = urlparse(self.path)
+        path = parsed.path
         if path in {"/", "/index.html"}:
             self.serve_file(WEB_ROOT / "index.html")
             return
@@ -1123,10 +1925,51 @@ class FxRiskHandler(BaseHTTPRequestHandler):
             rates = load_rates(merged_config(state))
             self.send_json(build_dashboard(state, rates))
             return
+        if path in {"/api/export", "/api/workspace/export"}:
+            state = validate_workspace_state(ensure_state())
+            self.send_json({
+                "ok": True,
+                "exported_at": now_iso(),
+                "data_file": str(STATE_FILE),
+                "state": state,
+                "workspace": state,
+                "metadata": state.get("metadata", {}),
+                "backups": list_backups(),
+            })
+            return
+        if path == "/api/backups":
+            self.send_json({"backups": list_backups(), "data_file": str(STATE_FILE)})
+            return
+        if path == "/api/csv/export":
+            try:
+                collection = csv_collection(parse_qs(parsed.query).get("collection", [""])[0])
+                self.send_csv(
+                    export_collection_csv(ensure_state(), collection),
+                    f"{collection}-{now_iso()[:10]}.csv",
+                )
+            except ValueError as exc:
+                self.send_json({"ok": False, "error": str(exc)}, status=400)
+            return
+        if path == "/api/xlsx/export":
+            try:
+                collection = csv_collection(parse_qs(parsed.query).get("collection", [""])[0])
+                self.send_binary(
+                    build_xlsx(collection, ensure_state()),
+                    "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    f"{collection}-{now_iso()[:10]}.xlsx",
+                )
+            except ValueError as exc:
+                self.send_json({"ok": False, "error": str(exc)}, status=400)
+            return
         self.send_error(404)
 
     def do_POST(self) -> None:
         try:
+            blocked = check_mutation_headers(self)
+            if blocked:
+                status, message = blocked
+                self.send_json({"ok": False, "error": message}, status=status)
+                return
             body = parse_body(self)
             # Network refresh touches only the rate cache, so keep it outside
             # the state lock to avoid holding it during the HTTP fetch.
@@ -1139,37 +1982,42 @@ class FxRiskHandler(BaseHTTPRequestHandler):
             with STATE_LOCK:
                 state = ensure_state()
                 if self.path == "/api/exposures":
-                    validate_exposure(body)
+                    validate_exposure(body, merged_config(state))
                     row = add_id(body)
                     state.setdefault("exposures", []).append(row)
-                    save_state(state)
+                    save_state(state, reason="create-exposure")
                     append_audit("create", "exposures", row.get("id"), None, row)
                     self.send_json({"ok": True})
                     return
                 if self.path == "/api/hedges":
-                    validate_hedge(body)
+                    validate_hedge(body, merged_config(state))
                     row = add_id(body)
                     state.setdefault("hedges", []).append(row)
-                    save_state(state)
+                    save_state(state, reason="create-hedge")
                     append_audit("create", "hedges", row.get("id"), None, row)
                     self.send_json({"ok": True})
                     return
                 if self.path == "/api/settlements":
-                    validate_settlement(body)
+                    validate_settlement(body, merged_config(state))
                     row = add_id(body)
                     state.setdefault("settlements", []).append(row)
-                    save_state(state)
+                    save_state(state, reason="create-settlement")
                     append_audit("create", "settlements", row.get("id"), None, row)
                     self.send_json({"ok": True})
                     return
                 if self.path == "/api/config":
-                    merged = dict(DEFAULT_CONFIG)
-                    before = dict(merged)
-                    before.update(state.get("config", {}))
-                    merged.update(state.get("config", {}))
-                    merged.update(body)
+                    before = merged_config(state)
+                    replace_maps = {
+                        key for key in (
+                            "interest_rates", "forward_overrides", "scenario_shifts",
+                            "month_currency_hedge_ratios", "monthly_average_rates",
+                            "confirmed_parameters",
+                        )
+                        if key in body
+                    }
+                    merged = validate_config(body, base=before, replace_maps=replace_maps)
                     state["config"] = merged
-                    save_state(state)
+                    save_state(state, reason="update-config")
                     changed = {
                         key: {"from": before.get(key), "to": value}
                         for key, value in merged.items()
@@ -1181,11 +2029,13 @@ class FxRiskHandler(BaseHTTPRequestHandler):
                     return
                 if self.path == "/api/plans":
                     dashboard = build_dashboard(state, plan_rates)
+                    if dashboard["portfolio"].get("rate_missing"):
+                        raise ValueError("存在缺失汇率的敞口，不能冻结为完整方案")
                     if not dashboard["suggestions"]:
                         raise ValueError("没有待锁汇建议，无法冻结方案")
                     plan = add_id(plans.freeze(dashboard, body.get("label"), now_iso()))
                     state.setdefault("plans", []).append(plan)
-                    save_state(state)
+                    save_state(state, reason="freeze-plan")
                     append_audit("freeze", "plans", plan.get("id"), None,
                                  {"label": plan["label"], "rows": len(plan["rows"])})
                     self.send_json({"ok": True, "plan": plan})
@@ -1194,27 +2044,144 @@ class FxRiskHandler(BaseHTTPRequestHandler):
                     before_reset = state
                     # 方案是只读存档，"恢复样例"的语义是重置工作数据，
                     # 不该连历史快照一起抹掉——那是不可逆的，确认框也没提。
-                    reset_state = {**DEMO_STATE, "plans": state.get("plans", [])}
-                    save_state(reset_state)
+                    reset_state = sample_state(keep_plans=state.get("plans", []))
+                    save_state(reset_state, reason="reset-demo")
                     # 先写盘再记日志：反过来的话，写盘失败会在只追加的历史里
                     # 永久留下一条"重置过"的假记录。
                     append_audit("reset", "workspace", None, before_reset, reset_state)
                     self.send_json({"ok": True})
                     return
+                if self.path == "/api/clear-business":
+                    before_clear = state
+                    cleared_state = {
+                        **state,
+                        "metadata": {**state.get("metadata", {}), "setup_complete": True, "data_mode": "empty"},
+                        "exposures": [],
+                        "hedges": [],
+                        "settlements": [],
+                    }
+                    save_state(cleared_state, reason="clear-business")
+                    append_audit("clear", "workspace", None, before_clear, cleared_state)
+                    self.send_json({"ok": True})
+                    return
+                if self.path in {"/api/import", "/api/workspace/import"}:
+                    imported = validate_workspace_state(body.get("workspace", body.get("state", body)))
+                    before_import = state
+                    save_state(imported, reason="import-workspace")
+                    append_audit("import", "workspace", None, before_import,
+                                 {"rows": {key: len(imported.get(key, []))
+                                           for key in ("exposures", "hedges", "settlements", "plans")}})
+                    self.send_json({"ok": True, "metadata": imported.get("metadata", {}), "backup_count": len(list_backups())})
+                    return
+                if self.path == "/api/csv/import":
+                    collection = csv_collection(body.get("collection"))
+                    imported_rows = parse_collection_csv(collection, body.get("csv", ""), merged_config(state))
+                    before_rows = list(state.get(collection, []))
+                    state.setdefault(collection, []).extend(imported_rows)
+                    save_state(state, reason=f"import-csv-{collection}")
+                    append_audit("import", collection, None, before_rows, {"rows": len(imported_rows)})
+                    self.send_json({"ok": True, "collection": collection, "imported": len(imported_rows)})
+                    return
+                if self.path == "/api/xlsx/import":
+                    collection = csv_collection(body.get("collection"))
+                    imported_rows = parse_collection_xlsx(collection, body.get("data_b64", ""), merged_config(state))
+                    before_rows = list(state.get(collection, []))
+                    state.setdefault(collection, []).extend(imported_rows)
+                    save_state(state, reason=f"import-xlsx-{collection}")
+                    append_audit("import", collection, None, before_rows, {"rows": len(imported_rows)})
+                    self.send_json({"ok": True, "collection": collection, "imported": len(imported_rows)})
+                    return
+                if self.path == "/api/workspace/empty":
+                    before_empty = state
+                    cleared_state = empty_state(setup_complete=True)
+                    save_state(cleared_state, reason="empty-workspace")
+                    append_audit("reset", "workspace", None, before_empty, cleared_state)
+                    self.send_json({"ok": True, "metadata": cleared_state["metadata"]})
+                    return
+                if self.path == "/api/workspace/sample":
+                    before_sample = state
+                    next_state = sample_state(keep_plans=state.get("plans", []))
+                    save_state(next_state, reason="sample-workspace")
+                    append_audit("reset", "workspace", None, before_sample, next_state)
+                    self.send_json({"ok": True, "metadata": next_state["metadata"]})
+                    return
+                if self.path == "/api/backups/latest/restore":
+                    before_restore = state
+                    restored = restore_backup()
+                    append_audit("restore", "workspace", None, before_restore,
+                                 {"backup": "latest", "rows": {key: len(restored.get(key, []))
+                                                               for key in ("exposures", "hedges", "settlements", "plans")}})
+                    self.send_json({"ok": True})
+                    return
+                parts = self.path.strip("/").split("/")
+                if len(parts) == 4 and parts[0] == "api" and parts[1] == "backups" and parts[3] == "restore":
+                    before_restore = state
+                    restored = restore_backup(parts[2])
+                    append_audit("restore", "workspace", None, before_restore,
+                                 {"backup": parts[2], "rows": {key: len(restored.get(key, []))
+                                                               for key in ("exposures", "hedges", "settlements", "plans")}})
+                    self.send_json({"ok": True})
+                    return
+        except TypeError as exc:
+            self.send_json({"ok": False, "error": str(exc)}, status=415)
+            return
+        except FileNotFoundError as exc:
+            self.send_json({"ok": False, "error": str(exc)}, status=404)
+            return
+        except (ValueError, KeyError, json.JSONDecodeError) as exc:
+            self.send_json({"ok": False, "error": str(exc)}, status=400)
+            return
+        self.send_error(404)
+
+    def do_PUT(self) -> None:
+        try:
+            blocked = check_mutation_headers(self)
+            if blocked:
+                status, message = blocked
+                self.send_json({"ok": False, "error": message}, status=status)
+                return
+            parts = self.path.strip("/").split("/")
+            if len(parts) == 3 and parts[0] == "api":
+                collection = mutable_collection(parts[1])
+                if collection and collection != "plans":
+                    record_id = parts[2]
+                    with STATE_LOCK:
+                        state = ensure_state()
+                        body = parse_body(self)
+                        config = merged_config(state)
+                        rows = state.get(collection, [])
+                        for index, row in enumerate(rows):
+                            if row.get("id") == record_id:
+                                before = dict(row)
+                                updated = {**row, **body, "id": record_id}
+                                if row.get("created_at"):
+                                    updated["created_at"] = row["created_at"]
+                                validate_for_collection(collection, updated, config)
+                                updated = add_id(updated)
+                                rows[index] = updated
+                                save_state(state, reason=f"update-{collection}")
+                                append_audit("update", collection, record_id, before, updated)
+                                self.send_json({"ok": True, "record": updated})
+                                return
+                        self.send_json({"ok": False, "error": "record not found"}, status=404)
+                        return
+        except TypeError as exc:
+            self.send_json({"ok": False, "error": str(exc)}, status=415)
+            return
         except (ValueError, KeyError, json.JSONDecodeError) as exc:
             self.send_json({"ok": False, "error": str(exc)}, status=400)
             return
         self.send_error(404)
 
     def do_DELETE(self) -> None:
+        blocked = check_mutation_headers(self)
+        if blocked:
+            status, message = blocked
+            self.send_json({"ok": False, "error": message}, status=status)
+            return
         parts = self.path.strip("/").split("/")
         if len(parts) == 3 and parts[0] == "api":
-            collection = {
-                "exposures": "exposures",
-                "hedges": "hedges",
-                "settlements": "settlements",
-                "plans": "plans",
-            }.get(parts[1])
+            collection = mutable_collection(parts[1])
             if collection:
                 record_id = parts[2]
                 with STATE_LOCK:
@@ -1227,7 +2194,7 @@ class FxRiskHandler(BaseHTTPRequestHandler):
                         self.send_json({"ok": False, "error": "record not found"}, status=404)
                         return
                     state[collection] = [row for row in rows if row.get("id") != record_id]
-                    save_state(state)
+                    save_state(state, reason=f"delete-{collection}")
                     # 审计必须在锁内追加：放到锁外的话，另一个请求可能先提交
                     # 并写完自己的日志，倒序展示出来就是"删除比它之后发生的
                     # 改动还新"——日志顺序和实际状态变更顺序对不上。
@@ -1236,6 +2203,16 @@ class FxRiskHandler(BaseHTTPRequestHandler):
                 self.send_json({"ok": True, "deleted": len(removed)})
                 return
         self.send_error(404)
+
+    def send_security_headers(self) -> None:
+        self.send_header("X-Content-Type-Options", "nosniff")
+        self.send_header("X-Frame-Options", "DENY")
+        self.send_header("Referrer-Policy", "no-referrer")
+        self.send_header(
+            "Content-Security-Policy",
+            "default-src 'self'; connect-src 'self'; img-src 'self' data:; "
+            "style-src 'self' 'unsafe-inline'; script-src 'self' 'unsafe-inline'; frame-ancestors 'none'",
+        )
 
     def serve_file(self, path: Path) -> None:
         if not path.exists() or not path.is_file():
@@ -1247,6 +2224,7 @@ class FxRiskHandler(BaseHTTPRequestHandler):
         self.send_header("Content-Type", content_type + "; charset=utf-8")
         self.send_header("Content-Length", str(len(payload)))
         self.send_header("Cache-Control", "no-store")
+        self.send_security_headers()
         self.end_headers()
         self.wfile.write(payload)
 
@@ -1254,6 +2232,26 @@ class FxRiskHandler(BaseHTTPRequestHandler):
         payload = json.dumps(data, ensure_ascii=False).encode("utf-8")
         self.send_response(status)
         self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_security_headers()
+        self.send_header("Content-Length", str(len(payload)))
+        self.end_headers()
+        self.wfile.write(payload)
+
+    def send_csv(self, text: str, filename: str, status: int = 200) -> None:
+        payload = ("\ufeff" + text).encode("utf-8")
+        self.send_response(status)
+        self.send_header("Content-Type", "text/csv; charset=utf-8")
+        self.send_header("Content-Disposition", f'attachment; filename="{filename}"')
+        self.send_security_headers()
+        self.send_header("Content-Length", str(len(payload)))
+        self.end_headers()
+        self.wfile.write(payload)
+
+    def send_binary(self, payload: bytes, content_type: str, filename: str, status: int = 200) -> None:
+        self.send_response(status)
+        self.send_header("Content-Type", content_type)
+        self.send_header("Content-Disposition", f'attachment; filename="{filename}"')
+        self.send_security_headers()
         self.send_header("Content-Length", str(len(payload)))
         self.end_headers()
         self.wfile.write(payload)
@@ -1262,20 +2260,19 @@ class FxRiskHandler(BaseHTTPRequestHandler):
         print(f"[{now_iso()}] {self.address_string()} {fmt % args}")
 
 
-def validate_exposure(row: dict) -> None:
+def validate_exposure(row: dict, config: dict | None = None, allow_legacy_category: bool = False) -> None:
     required = ["due_date", "currency", "amount", "direction"]
     missing = [key for key in required if not row.get(key)]
     if missing:
-        raise ValueError(f"missing exposure fields: {', '.join(missing)}")
+        raise ValueError(f"敞口缺少字段: {', '.join(missing)}")
+    validate_currency(row, config or DEFAULT_CONFIG)
+    parse_iso_date(row["due_date"], "due_date")
     if row["direction"] not in {"receipt", "payment"}:
-        raise ValueError("exposure direction must be receipt or payment")
-    if float(row["amount"]) <= 0:
-        raise ValueError("amount must be positive")
+        raise ValueError("敞口方向必须是 receipt 或 payment")
+    row["amount"] = positive_number(row["amount"], "amount")
     category = row.get("category") or DEFAULT_CATEGORY
-    if not known_category(category):
-        raise ValueError(
-            "exposure category must be one of " + "/".join(EXPOSURE_CATEGORIES) + f"; got {category!r}"
-        )
+    if not known_category(category) and not allow_legacy_category:
+        raise ValueError("风险类型必须是 " + "/".join(EXPOSURE_CATEGORIES))
     row["category"] = category
     raw_probability = row.get("probability")
     # 不能写成 `or 1`：0 是假值，会被悄悄换成 1，
@@ -1285,9 +2282,9 @@ def validate_exposure(row: dict) -> None:
     try:
         probability = float(raw_probability)
     except (TypeError, ValueError):
-        raise ValueError("probability must be a number in (0, 1]") from None
+        raise ValueError("probability 必须是 (0, 1] 内的数字") from None
     if not 0 < probability <= 1:
-        raise ValueError("probability must be in (0, 1]")
+        raise ValueError("probability 必须在 (0, 1] 内")
     row["probability"] = probability
     booked = row.get("booked")
     if isinstance(booked, str):
@@ -1301,24 +2298,30 @@ def validate_exposure(row: dict) -> None:
     row["suggestion_reason"] = reason
 
 
-def validate_hedge(row: dict) -> None:
+def validate_hedge(row: dict, config: dict | None = None) -> None:
     required = ["trade_date", "due_date", "currency", "amount", "action", "locked_rate"]
     missing = [key for key in required if not row.get(key)]
     if missing:
-        raise ValueError(f"missing hedge fields: {', '.join(missing)}")
+        raise ValueError(f"锁汇缺少字段: {', '.join(missing)}")
+    validate_currency(row, config or DEFAULT_CONFIG)
+    trade_date = parse_iso_date(row["trade_date"], "trade_date")
+    due_date = parse_iso_date(row["due_date"], "due_date")
+    if trade_date > due_date:
+        raise ValueError("trade_date 不能晚于 due_date")
     if row["action"] not in {"buy_foreign", "sell_foreign"}:
-        raise ValueError("hedge action must be buy_foreign or sell_foreign")
-    if float(row["amount"]) <= 0 or float(row["locked_rate"]) <= 0:
-        raise ValueError("amount and locked_rate must be positive")
+        raise ValueError("锁汇方向必须是 buy_foreign 或 sell_foreign")
+    row["amount"] = positive_number(row["amount"], "amount")
+    row["locked_rate"] = positive_number(row["locked_rate"], "locked_rate")
 
 
-def validate_settlement(row: dict) -> None:
+def validate_settlement(row: dict, config: dict | None = None) -> None:
     required = ["due_date", "currency", "actual_rate"]
     missing = [key for key in required if not row.get(key)]
     if missing:
-        raise ValueError(f"missing settlement fields: {', '.join(missing)}")
-    if float(row["actual_rate"]) <= 0:
-        raise ValueError("actual_rate must be positive")
+        raise ValueError(f"结算缺少字段: {', '.join(missing)}")
+    validate_currency(row, config or DEFAULT_CONFIG)
+    parse_iso_date(row["due_date"], "due_date")
+    row["actual_rate"] = positive_number(row["actual_rate"], "actual_rate")
     # 实际发生额是可选的，但一旦填了就必须是非负数。
     # 填 0 是有意义的（订单黄了），所以这里**不能**用 `or` 兜底。
     raw_amount = row.get("actual_amount")
@@ -1328,9 +2331,9 @@ def validate_settlement(row: dict) -> None:
     try:
         actual_amount = float(raw_amount)
     except (TypeError, ValueError):
-        raise ValueError("actual_amount must be a number") from None
+        raise ValueError("actual_amount 必须是数字") from None
     if actual_amount < 0:
-        raise ValueError("actual_amount must not be negative")
+        raise ValueError("actual_amount 不能为负")
     row["actual_amount"] = actual_amount
 
 
@@ -1348,6 +2351,8 @@ class FxRiskServer(ThreadingHTTPServer):
 def run(host: str, port: int) -> None:
     ensure_state()
     server = FxRiskServer((host, port), FxRiskHandler)
+    if host.strip("[]").lower() not in {"127.0.0.1", "localhost", "::1"}:
+        print("安全警告：当前服务可被其他设备访问，但未提供身份认证；请勿在公网或不可信网络中使用。")
     print(f"FX risk web app running at http://{host}:{port}")
     server.serve_forever()
 

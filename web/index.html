@@ -4,7 +4,7 @@
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>外汇风险与锁汇工作台</title>
-    <link rel="stylesheet" href="/web/styles.css?v=16" />
+    <link rel="stylesheet" href="/web/styles.css?v=17" />
   </head>
   <body>
     <header class="topbar">
@@ -13,6 +13,7 @@
         <p>录入敞口，查看锁汇建议，记录执行，回看到期收益。</p>
       </div>
       <div class="actions">
+        <span id="workspaceBadge" class="workspace-badge">Loading...</span>
         <button id="refreshRatesBtn" type="button">刷新汇率</button>
         <button id="resetDemoBtn" type="button" class="danger-outline">恢复样例</button>
       </div>
@@ -37,6 +38,7 @@
           <span class="nav-title">其他</span>
           <a href="#plans" data-nav="plans">方案存档</a>
           <a href="#audit" data-nav="audit">变更记录</a>
+          <a href="#dataManagement" data-nav="dataManagement">数据管理</a>
           <a href="#rates" data-nav="rates">汇率与缓存</a>
           <a href="#config" data-nav="config">配置</a>
         </div>
@@ -45,6 +47,17 @@
       <main>
         <section id="statusBar" class="status-bar" role="status">
           Ready
+        </section>
+
+        <section id="setupPanel" class="panel setup-panel" hidden>
+          <div class="panel-title">
+            <h2>首次使用</h2>
+            <p>选择从空白工作区开始，或加载一份样例数据熟悉流程。</p>
+          </div>
+          <div class="actions">
+            <button id="startEmptyBtn" type="button">空白工作区</button>
+            <button id="startSampleBtn" type="button" class="secondary">加载样例</button>
+          </div>
         </section>
 
         <!-- ==================== 统计区 ==================== -->
@@ -125,8 +138,8 @@
                 <option value="payment">未来付外币</option>
               </select>
             </label>
-            <label>金额 <input name="amount" type="number" min="0" step="0.01" required /></label>
-            <label>概率 <input name="probability" type="number" min="0" max="1" step="0.01" value="1" /></label>
+            <label>金额 <input name="amount" type="number" min="0.01" step="0.01" required /></label>
+            <label>概率（%） <input name="probability" type="number" min="1" max="100" step="1" value="100" /></label>
             <label class="checkbox-label">
               <input name="booked" type="checkbox" /> 已入账 / 已开票
             </label>
@@ -153,8 +166,8 @@
                 <option value="buy_foreign">买入外币/远期购汇</option>
               </select>
             </label>
-            <label>锁汇金额 <input name="amount" type="number" min="0" step="0.01" required /></label>
-            <label>锁定汇率 <input name="locked_rate" type="number" min="0" step="0.000001" required /></label>
+            <label>锁汇金额 <input name="amount" type="number" min="0.01" step="0.01" required /></label>
+            <label>锁定汇率 <input name="locked_rate" type="number" min="0.000001" step="0.000001" required /></label>
             <label>备注 <input name="description" placeholder="例如：银行远期结汇" /></label>
             <button type="submit">记录锁汇</button>
           </form>
@@ -204,7 +217,28 @@
                     <th class="col-action"></th>
                   </tr>
                 </thead>
-                <tbody id="hedgeRows"></tbody>
+              <tbody id="hedgeRows"></tbody>
+            </table>
+          </div>
+          </section>
+          <section class="panel">
+            <div class="panel-title">
+              <h2>结算明细</h2>
+              <span class="meta" id="settlementCount"></span>
+            </div>
+            <div class="table-wrap">
+              <table class="detail-table">
+                <thead>
+                  <tr>
+                    <th>到期日</th>
+                    <th>币种</th>
+                    <th>实际汇率</th>
+                    <th>实际发生额</th>
+                    <th>备注</th>
+                    <th class="col-action"></th>
+                  </tr>
+                </thead>
+                <tbody id="settlementRows"></tbody>
               </table>
             </div>
           </section>
@@ -215,7 +249,7 @@
             <h2>添加到期实际汇率</h2>
             <label>到期日 <input name="due_date" type="date" required /></label>
             <label>币种 <input name="currency" value="USD" maxlength="3" required /></label>
-            <label>实际汇率 <input name="actual_rate" type="number" min="0" step="0.000001" required /></label>
+            <label>实际汇率 <input name="actual_rate" type="number" min="0.000001" step="0.000001" required /></label>
             <label>实际发生额 <input name="actual_amount" type="number" min="0" step="0.01" placeholder="选填；订单黄了就填 0" /></label>
             <label>备注 <input name="description" placeholder="例如：到期结算汇率" /></label>
             <button type="submit">保存实际汇率</button>
@@ -266,6 +300,35 @@
           </div>
         </section>
 
+        <section id="dataManagement" class="panel">
+          <div class="panel-title">
+            <h2>数据管理</h2>
+            <span class="meta" id="dataFilePath"></span>
+          </div>
+          <p class="notice">导入、恢复样例、清空业务数据和恢复备份都会先自动备份当前工作区；恢复备份会覆盖当前数据。</p>
+          <div class="data-actions">
+            <button id="exportWorkspaceBtn" type="button">导出工作区 JSON</button>
+            <label class="file-action">导入工作区 JSON <input id="importWorkspaceFile" type="file" accept="application/json,.json" /></label>
+            <button id="restoreLatestBackupBtn" type="button" class="secondary">恢复最近备份</button>
+            <button id="undoDeleteBtn" type="button" class="secondary" disabled>撤销最近删除</button>
+            <button id="clearBusinessBtn" type="button" class="danger-outline">清空业务数据</button>
+          </div>
+          <div class="data-actions data-actions-secondary">
+            <label>明细类型
+              <select id="csvCollectionSelect">
+                <option value="exposures">敞口明细</option>
+                <option value="hedges">锁汇明细</option>
+                <option value="settlements">结算明细</option>
+              </select>
+            </label>
+            <button id="exportCsvBtn" type="button" class="secondary">导出明细 CSV</button>
+            <label class="file-action">导入明细 CSV <input id="importCsvFile" type="file" accept=".csv,text/csv" /></label>
+            <button id="exportXlsxBtn" type="button" class="secondary">导出明细 Excel</button>
+            <label class="file-action">导入明细 Excel <input id="importXlsxFile" type="file" accept=".xlsx,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" /></label>
+          </div>
+          <p class="notice" id="backupStatus"></p>
+        </section>
+
         <section id="rates" class="panel compact-panel">
           <div class="panel-title">
             <h2>汇率与缓存</h2>
@@ -288,16 +351,30 @@
                 <option value="import">进口型</option>
               </select>
             </label>
-            <label>默认套保比例 <input name="default_hedge_ratio" type="number" min="0" max="1" step="0.05" /></label>
-            <label>乐观场景涨跌幅 <input name="optimistic_shift_pct" type="number" step="0.01" /></label>
-            <label>悲观场景涨跌幅 <input name="pessimistic_shift_pct" type="number" step="0.01" /></label>
-            <label>自定义场景涨跌幅 <input name="custom_scenario_shift_pct" type="number" step="0.01" /></label>
+            <label>默认套保比例（%） <input name="default_hedge_ratio" type="number" min="0" max="100" step="5" /></label>
+            <label>乐观场景涨跌幅（%） <input name="optimistic_shift_pct" type="number" min="-99.99" step="0.1" /></label>
+            <label>悲观场景涨跌幅（%） <input name="pessimistic_shift_pct" type="number" min="-99.99" step="0.1" /></label>
+            <label>自定义场景涨跌幅（%） <input name="custom_scenario_shift_pct" type="number" min="-99.99" step="0.1" /></label>
+            <label>支持币种 JSON <textarea name="supported_currencies" rows="3" data-json-field data-json-type="array" placeholder='["USD","EUR","JPY"]'></textarea></label>
+            <label>资金利率 JSON <textarea name="interest_rates" rows="4" data-json-field placeholder='{"CNY":0.019,"USD":0.043}'></textarea></label>
+            <label>银行远期报价 JSON <textarea name="forward_overrides" rows="4" data-json-field placeholder='{"2027-03:USD":7.08}'></textarea></label>
+            <label>分月分币种套保比例 JSON（0–1） <textarea name="month_currency_hedge_ratios" rows="4" data-json-field placeholder='{"2027-03":{"USD":0.75}}'></textarea></label>
+            <label>分币种场景 JSON（小数，-0.01 = -1%） <textarea name="scenario_shifts" rows="4" data-json-field placeholder='{"EUR":{"optimistic":-0.01}}'></textarea></label>
+            <label>财务月均汇率 JSON <textarea name="monthly_average_rates" rows="4" data-json-field placeholder='{"2027-03:USD":7.12}'></textarea></label>
+            <fieldset>
+              <legend>已人工核对的参数</legend>
+              <p class="notice">只有确实向行情源、银行或财务负责人核对过后再勾选；未勾选的建议会继续标为试算。</p>
+              <label class="checkbox-label"><input name="confirmed_parameters" value="rates" type="checkbox" data-confirmed-key="rates" /> 当前即期汇率已核对</label>
+              <label class="checkbox-label"><input name="confirmed_parameters" value="interest_rates" type="checkbox" data-confirmed-key="interest_rates" /> 资金利率已核对</label>
+              <label class="checkbox-label"><input name="confirmed_parameters" value="scenario_shifts" type="checkbox" data-confirmed-key="scenario_shifts" /> 情景假设已核对</label>
+            </fieldset>
+            <p id="configJsonError" class="notice notice-warn" role="alert"></p>
             <button type="submit">保存配置</button>
           </form>
         </section>
       </main>
     </div>
 
-    <script src="/web/app.js?v=16"></script>
+    <script src="/web/app.js?v=17"></script>
   </body>
 </html>
